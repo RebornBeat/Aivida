@@ -205,6 +205,19 @@ pub struct ResourceUsage {
     pub memory_used: u64,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UserRegistrationData {
+    pub email: String,
+    pub password: String,
+    pub confirm_password: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LoginCredentials {
+    pub email: String,
+    pub password: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceUpdate {
     pub worker_id: Uuid,
@@ -522,6 +535,26 @@ impl AividaClient {
         };
 
         self.send_to_server(message).await
+    }
+
+    async fn get_current_metrics(&self) -> Result<ResourceMetrics, AividaError> {
+        let mut sys = System::new_all();
+        sys.refresh_all();
+
+        Ok(ResourceMetrics {
+            cpuUtilization: sys.global_cpu_info().cpu_usage(),
+            gpuUtilization: 0.0, // Implement GPU monitoring
+            memoryUsed: sys.used_memory(),
+            networkBandwidth: {
+                upload: 0,
+                download: 0,
+            },
+        })
+    }
+
+    async fn get_available_jobs(&self) -> Result<Vec<Job>, AividaError> {
+        // Implement getting available jobs from server
+        todo!("Implement getting available jobs")
     }
 
     // Additional Security Features
