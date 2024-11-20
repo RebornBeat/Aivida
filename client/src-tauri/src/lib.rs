@@ -610,6 +610,109 @@ async fn update_resources(
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn register_user(
+    user_data: UserRegistrationData,
+    client: State<'_, Arc<Mutex<AividaClient>>>
+) -> Result<(), String> {
+    let client_lock = client.lock().await;
+    // Implement user registration
+    if user_data.password != user_data.confirm_password {
+        return Err("Passwords do not match".into());
+    }
+
+    // Hash password and store user
+    todo!("Implement user registration");
+}
+
+#[tauri::command]
+async fn login_user(
+    credentials: LoginCredentials,
+    client: State<'_, Arc<Mutex<AividaClient>>>
+) -> Result<(), String> {
+    let client_lock = client.lock().await;
+    // Implement user authentication
+    todo!("Implement user login");
+}
+
+#[tauri::command]
+async fn get_resources(
+    client: State<'_, Arc<Mutex<AividaClient>>>
+) -> Result<ResourceMetrics, String> {
+    let client_lock = client.lock().await;
+    // Get current resource metrics
+    let metrics = client_lock.get_current_metrics().await
+        .map_err(|e| e.to_string())?;
+    Ok(metrics)
+}
+
+#[tauri::command]
+async fn get_active_jobs(
+    client: State<'_, Arc<Mutex<AividaClient>>>
+) -> Result<Vec<Job>, String> {
+    let client_lock = client.lock().await;
+    let jobs = client_lock.active_jobs.read().await;
+    Ok(jobs.values().cloned().collect())
+}
+
+#[tauri::command]
+async fn get_available_jobs(
+    client: State<'_, Arc<Mutex<AividaClient>>>
+) -> Result<Vec<Job>, String> {
+    let client_lock = client.lock().await;
+    let jobs = client_lock.get_available_jobs().await
+        .map_err(|e| e.to_string())?;
+    Ok(jobs)
+}
+
+#[tauri::command]
+async fn get_worker_info(
+    client: State<'_, Arc<Mutex<AividaClient>>>
+) -> Result<Option<WorkerInfo>, String> {
+    let client_lock = client.lock().await;
+    Ok(client_lock.worker_info.clone())
+}
+
+#[tauri::command]
+async fn detect_hardware() -> Result<ResourceCapabilities, String> {
+    let sys = System::new_all();
+
+    // Get CPU info
+    let cpu_info = CPUInfo {
+        cores: sys.physical_core_count().unwrap_or(0) as u32,
+        threads: sys.cpus().len() as u32,
+        architecture: std::env::consts::ARCH.to_string(),
+    };
+
+    // Get GPU info (implement based on your GPU detection method)
+    let gpu_info = vec![]; // Implement GPU detection
+
+    Ok(ResourceCapabilities {
+        gpu: gpu_info,
+        cpu: cpu_info,
+        memory: sys.total_memory(),
+        bandwidth: 0, // Implement bandwidth detection
+    })
+}
+
+#[tauri::command]
+async fn get_resource_metrics(
+    client: State<'_, Arc<Mutex<AividaClient>>>
+) -> Result<ResourceMetrics, String> {
+    let mut sys = System::new_all();
+    sys.refresh_all();
+
+    Ok(ResourceMetrics {
+        cpuUtilization: sys.global_cpu_info().cpu_usage(),
+        gpuUtilization: 0.0, // Implement GPU monitoring
+        memoryUsed: sys.used_memory(),
+        networkBandwidth: {
+            upload: 0,
+            download: 0,
+        },
+    })
+}
+
 // Tauri application entry point
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -634,6 +737,14 @@ pub fn run() {
             init_client,
             submit_job,
             update_resources,
+            register_user,
+            login_user,
+            get_resources,
+            get_active_jobs,
+            get_available_jobs,
+            get_worker_info,
+            detect_hardware,
+            get_resource_metrics,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
