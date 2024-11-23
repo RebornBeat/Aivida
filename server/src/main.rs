@@ -1506,65 +1506,88 @@ mod sample {
             layers: Vec<Vec<Uuid>>, // Worker IDs organized in hierarchy
         },
     }
+
+    impl Sample {
+        // Sample complexity calculations
+        pub fn feature_extraction_complexity(&self) -> u64 {
+            // Calculate based on feature types and operations
+            self.features.iter()
+                .map(|f| f.compute_complexity())
+                .sum()
+        }
+
+        pub fn dimensions(&self) -> &[u64] {
+            &self.shape
+        }
+    }
+
 }
 
 mod cost {
     use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
     use uuid::Uuid;
     use chrono::{DateTime, Utc};
-    use crate::core_identifiers::;
-    use crate::metrics::;
+    use crate::core::{CoreType, ProcessingUnit, CoreGroup};
+    use crate::core_identifiers::*;
+    use crate::sample::Sample;
+    use crate::metrics::MetricsTracker;
+    use crate::errors::CostError;
+    use crate::job::{ComputeJob, JobRequirements};
 
     #[derive(Debug, Clone)]
     pub struct CostProfile {
-        pub base_cost_per_hour: f64,
-        pub operation_costs: OperationCosts,
-        pub scaling_factors: ScalingFactors,
+        pub base_compute_unit_cost: f64,    // Base cost per compute unit
+        pub gpu_multiplier: f64,            // GPU cost scaling factor
+        pub cpu_multiplier: f64,            // CPU cost scaling factor
+        pub minimum_gpu_cost: f64,          // Minimum cost floor for GPU ops
+        pub minimum_cpu_cost: f64,          // Minimum cost floor for CPU ops
+        pub scaling_factors: ScalingFactors, // Dynamic scaling factors
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct ScalingFactors {
+        pub performance_multiplier: f64,  // Based on processing efficiency
+        pub availability_multiplier: f64, // Based on resource availability
+        pub demand_multiplier: f64,       // Based on current system load
+        pub priority_multiplier: f64,     // Based on job priority
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct CoreCost {
+        pub base_cost: f64,
+        pub efficiency_factor: f64,
+        pub usage_factor: f64,
+        pub total: f64,
+        pub compute_units_processed: u64,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct JobCost {
+        pub total: f64,
+        pub core_breakdown: HashMap<CoreId, CoreCost>,
+        pub compute_units: u64,
+        pub group_efficiency: f64,
+        pub timestamp: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct GroupCost {
+        pub total: f64,
+        pub core_costs: HashMap<CoreId, CoreCost>,
+        pub efficiency: f64,
+        pub compute_units_processed: u64,
     }
 
     #[derive(Debug, Clone)]
     pub struct CostManager {
         db: Pool<Postgres>,
         metrics_tracker: Arc<MetricsTracker>,
-        cost_config: CostConfig,
+        cost_profile: Arc<Mutex<CostProfile>>,
         execution_stats: Arc<Mutex<ExecutionStats>>,
         transaction_processor: Arc<TransactionProcessor>,
-    }
-
-    #[derive(Debug, Clone)]
-    struct CostConfig {
-        base_compute_cost: f64,
-        memory_cost_per_gb: f64,
-        network_cost_per_gb: f64,
-        peak_hour_multiplier: f64,
-        minimum_efficiency_threshold: f64,
-        optimization_interval: Duration,
-    }
-
-    #[derive(Debug, Clone)]
-    pub struct OperationCosts {
-        pub compute_cost: f64,
-        pub memory_cost: f64,
-        pub network_cost: f64,
-        pub storage_cost: f64,
-    }
-
-    #[derive(Debug, Clone)]
-    pub struct ScalingFactors {
-        pub performance_multiplier: f64,
-        pub availability_multiplier: f64,
-        pub demand_multiplier: f64,
-        pub priority_multiplier: f64,
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct CostMetrics {
-        total_cost: f64,
-        compute_cost: f64,
-        memory_cost: f64,
-        network_cost: f64,
-        efficiency_score: f64,
-        timestamp: DateTime<Utc>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1573,6 +1596,21 @@ mod cost {
         pub user_id: Uuid,
         pub amount: f64,
         pub transaction_type: TransactionType,
+        pub timestamp: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub enum TransactionType {
+        JobPayment {
+            job_id: Uuid,
+            compute_units: u64,
+        },
+        ResourceProvision {
+            core_id: CoreId,
+            compute_units: u64,
+        },
+        Deposit,
+        Withdrawal,
     }
 
     #[derive(Debug, Clone)]
@@ -1582,259 +1620,259 @@ mod cost {
         pub compliance_check: ComplianceCheck,
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub enum TransactionType {
-        JobPayment(Uuid),
-        ResourceProvision(Uuid),
-        Deposit,
-        Withdrawal,
-    }
-
     impl CostManager {
         pub async fn new(
             db: Pool<Postgres>,
             metrics_tracker: Arc<MetricsTracker>,
-            config: CostConfig,
+            cost_profile: CostProfile,
         ) -> Result<Self, CostError> {
             Ok(Self {
                 db,
                 metrics_tracker,
-                cost_config: config,
-                execution_stats: Arc::new(Mutex::new(ExecutionStats::default())),
+                cost_profile: Arc::new(Mutex::new(cost_profile)),
                 transaction_processor: Arc::new(TransactionProcessor::new(db.clone())),
             })
         }
 
-        /// Calculates the cost efficiency of current operations
-        pub async fn calculate_cost_efficiency(&self, group_id: GroupId) -> Result<f64, CostError> {
-            let metrics = self.metrics_tracker.get_group_metrics(group_id).await?;
-            let costs = self.calculate_operational_costs(&metrics).await?;
+        pub async fn calculate_processing_cost(
+            &self,
+            samples: &[Sample],
+            core: &ProcessingUnit
+        ) -> Result<f64, CostError> {
+            let compute_units = self.calculate_total_compute_units(samples)?;
+            let core_cost = self.calculate_core_cost(core, compute_units, None).await?;
 
-            let efficiency = metrics.performance_score / costs.total_cost;
-
-            // Track efficiency metrics
-            self.track_efficiency_metric(group_id, efficiency).await?;
-
-            Ok(efficiency)
+            Ok(core_cost.total)
         }
 
-        /// Calculates the execution cost for a specific workload
-        pub async fn calculate_execution_cost(
-            &self,
-            workload: &Workload,
-            resources: &ResourceUsage,
-        ) -> Result<ExecutionCost, CostError> {
-            let base_cost = self.calculate_base_cost(resources);
-            let time_multiplier = self.get_time_cost_multiplier().await;
-            let usage_multiplier = self.calculate_usage_multiplier(resources);
-
-            let cost_components = CostComponents {
-                compute: base_cost * self.cost_config.base_compute_cost * usage_multiplier,
-                memory: (resources.memory_used as f64 / 1024.0 / 1024.0)
-                    * self.cost_config.memory_cost_per_gb,
-                network: (resources.network_transfer as f64 / 1024.0 / 1024.0)
-                    * self.cost_config.network_cost_per_gb,
-            };
-
-            let total_cost = cost_components.compute + cost_components.memory + cost_components.network;
-
-            // Track the cost calculation
-            self.track_cost_metrics(workload.id, &cost_components, total_cost * time_multiplier)
-                .await?;
-
-            Ok(ExecutionCost {
-                total: total_cost * time_multiplier,
-                components: cost_components,
-                metrics: self.collect_cost_metrics(workload, resources)?,
-            })
+        fn calculate_total_compute_units(&self, samples: &[Sample]) -> Result<u64, CostError> {
+            samples.iter()
+                .map(|s| self.calculate_sample_compute_units(s))
+                .sum::<Result<u64, CostError>>()
         }
 
-        /// Optimizes resource allocation based on cost efficiency
-        pub async fn optimize_resource_allocation(
-            &self,
-            current_allocation: &ResourceAllocation,
-        ) -> Result<OptimizationResult, CostError> {
-            // Get current metrics and costs
-            let current_metrics = self
-                .metrics_tracker
-                .get_allocation_metrics(current_allocation.id)
-                .await?;
-            let current_costs = self.calculate_allocation_costs(current_allocation).await?;
+        fn calculate_sample_compute_units(&self, sample: &Sample) -> Result<u64, CostError> {
+            let ops_per_element = sample.compute_complexity()?;
+            let total_elements = sample.total_elements()?;
 
-            // Generate optimization candidates
-            let candidates = self
-                .generate_optimization_candidates(current_allocation, &current_metrics, &current_costs)
-                .await?;
-
-            // Evaluate candidates
-            let best_candidate = self.evaluate_optimization_candidates(candidates).await?;
-
-            // Create implementation plan
-            let implementation_plan = self
-                .create_optimization_plan(current_allocation, &best_candidate)
-                .await?;
-
-            Ok(OptimizationResult {
-                suggested_allocation: best_candidate,
-                estimated_savings: self.calculate_estimated_savings(&current_costs, &best_candidate)?,
-                efficiency_improvement: self
-                    .calculate_efficiency_improvement(&current_metrics, &best_candidate)?,
-                implementation_steps: implementation_plan,
-            })
+            Ok(ops_per_element * total_elements)
         }
 
-        /// Tracks cost-related metrics over time
-        pub async fn track_cost_metrics(
-            &self,
-            workload_id: WorkloadId,
-            components: &CostComponents,
-            total_cost: f64,
-        ) -> Result<(), CostError> {
-            let metrics = CostMetrics {
-                total_cost,
-                compute_cost: components.compute,
-                memory_cost: components.memory,
-                network_cost: components.network,
-                efficiency_score: self.calculate_efficiency_score(components, total_cost)?,
+        pub async fn calculate_job_cost(&self, job: &ComputeJob) -> Result<JobCost, CostError> {
+            let group = job.get_core_group()?;
+            let total_compute_units = self.calculate_job_compute_units(job)?;
+            let mut core_costs = HashMap::new();
+            let mut total_cost = 0.0;
+
+            for core in &group.cores {
+                let core_units = self.get_core_compute_units(core, job)?;
+                let cost = self.calculate_core_cost(
+                    core,
+                    core_units,
+                    Some(&job.requirements)
+                ).await?;
+
+                core_costs.insert(core.id, cost.clone());
+                total_cost += cost.total;
+            }
+
+            let job_cost = JobCost {
+                total: total_cost,
+                core_breakdown: core_costs,
+                compute_units: total_compute_units,
+                group_efficiency: group.get_efficiency()?,
                 timestamp: Utc::now(),
             };
 
-            // Store in database
-            sqlx::query!(
-                r#"
-                INSERT INTO cost_metrics (
-                    workload_id,
-                    total_cost,
-                    compute_cost,
-                    memory_cost,
-                    network_cost,
-                    efficiency_score,
-                    timestamp
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
-                "#,
-                workload_id.0,
-                metrics.total_cost,
-                metrics.compute_cost,
-                metrics.memory_cost,
-                metrics.network_cost,
-                metrics.efficiency_score,
-                metrics.timestamp,
-            )
-            .execute(&self.db)
-            .await?;
+            // Record job cost metrics
+            self.metrics_tracker.record_job_cost(job.id, &job_cost).await?;
 
-            // Update in-memory metrics
-            self.update_running_metrics(workload_id, &metrics).await?;
+            Ok(job_cost)
+        }
+
+        pub async fn calculate_group_cost(
+            &self,
+            group: &CoreGroup,
+            compute_units: u64
+        ) -> Result<GroupCost, CostError> {
+            let mut core_costs = HashMap::new();
+            let mut total_cost = 0.0;
+            let mut total_units_processed = 0;
+
+            for core in &group.cores {
+                let cost = self.calculate_core_cost(
+                    core,
+                    compute_units / group.cores.len() as u64,
+                    None
+                ).await?;
+
+                total_cost += cost.total;
+                total_units_processed += cost.compute_units_processed;
+                core_costs.insert(core.id, cost);
+            }
+
+            Ok(GroupCost {
+                total: total_cost,
+                core_costs,
+                efficiency: group.get_efficiency()?,
+                compute_units_processed: total_units_processed,
+            })
+        }
+
+        pub async fn calculate_core_cost(
+            &self,
+            core: &ProcessingUnit,
+            compute_units: u64,
+            requirements: Option<&JobRequirements>
+        ) -> Result<CoreCost, CostError> {
+            let cost_profile = self.cost_profile.lock().await;
+            let metrics = self.metrics_tracker.get_core_metrics(core.id).await?;
+
+            // Calculate base cost based on core type
+            let base_cost = match &core.core_type {
+                CoreType::CUDA { compute_capability, .. } => {
+                    compute_units as f64 *
+                    cost_profile.base_compute_unit_cost *
+                    cost_profile.gpu_multiplier *
+                    *compute_capability as f64
+                },
+                CoreType::CPU { frequency, simd_width, .. } => {
+                    compute_units as f64 *
+                    cost_profile.base_compute_unit_cost *
+                    cost_profile.cpu_multiplier *
+                    frequency *
+                    simd_width.unwrap_or(1) as f64
+                }
+            };
+
+            // Apply efficiency and usage factors
+            let efficiency_factor = metrics.efficiency;
+            let usage_factor = self.calculate_usage_factor(&metrics).await?;
+
+            // Apply any job-specific requirements
+            let requirement_factor = if let Some(reqs) = requirements {
+                self.calculate_requirement_factor(reqs)
+            } else {
+                1.0
+            };
+
+            let total = base_cost * efficiency_factor * usage_factor * requirement_factor;
+
+            Ok(CoreCost {
+                base_cost,
+                efficiency_factor,
+                usage_factor,
+                total,
+                compute_units_processed: compute_units,
+            })
+        }
+
+        async fn calculate_usage_factor(&self, metrics: &CoreMetrics) -> Result<f64, CostError> {
+            let cost_profile = self.cost_profile.lock().await;
+
+            let performance = metrics.efficiency *
+                             cost_profile.scaling_factors.performance_multiplier;
+
+            let availability = (1.0 - metrics.utilization) *
+                             cost_profile.scaling_factors.availability_multiplier;
+
+            let demand = self.calculate_demand_factor().await?;
+
+            Ok(performance * availability * demand)
+        }
+
+        async fn calculate_demand_factor(&self) -> Result<f64, CostError> {
+            let cost_profile = self.cost_profile.lock().await;
+            let system_metrics = self.metrics_tracker.get_system_metrics().await?;
+
+            Ok(system_metrics.total_utilization *
+               cost_profile.scaling_factors.demand_multiplier)
+        }
+
+        fn calculate_requirement_factor(&self, requirements: &JobRequirements) -> f64 {
+            // Factor in job priority and specific requirements
+            1.0 + (requirements.priority as f64 * 0.1)
+        }
+
+        pub async fn update_core_costs(&self) -> Result<(), CostError> {
+            let metrics = self.metrics_tracker.get_system_metrics().await?;
+            let mut cost_profile = self.cost_profile.lock().await;
+
+            // Update base costs based on system-wide metrics
+            let utilization_factor = metrics.get_utilization_trend()?;
+            let efficiency_trend = metrics.get_efficiency_trend()?;
+
+            // Adjust GPU and CPU multipliers
+            cost_profile.gpu_multiplier = self.adjust_gpu_multiplier(
+                cost_profile.gpu_multiplier,
+                utilization_factor,
+                efficiency_trend
+            )?;
+
+            cost_profile.cpu_multiplier = self.adjust_cpu_multiplier(
+                cost_profile.cpu_multiplier,
+                utilization_factor,
+                efficiency_trend
+            )?;
+
+            // Update scaling factors based on current conditions
+            self.update_scaling_factors(&mut cost_profile, &metrics).await?;
+
+            // Store updated cost profile
+            self.store_cost_profile(&cost_profile).await?;
 
             Ok(())
         }
 
-        /// Processes a credit transaction with full validation
+        async fn update_scaling_factors(
+            &self,
+            cost_profile: &mut CostProfile,
+            metrics: &SystemMetrics,
+        ) -> Result<(), CostError> {
+            cost_profile.scaling_factors.performance_multiplier =
+                self.calculate_performance_scaling(metrics)?;
+
+            cost_profile.scaling_factors.availability_multiplier =
+                self.calculate_availability_scaling(metrics)?;
+
+            cost_profile.scaling_factors.demand_multiplier =
+                self.calculate_demand_scaling(metrics)?;
+
+            Ok(())
+        }
+
         pub async fn process_credit_transaction(
             &self,
-            transaction: CreditTransaction,
+            transaction: CreditTransaction
         ) -> Result<TransactionResult, CostError> {
-            // Validate transaction
             self.validate_transaction(&transaction).await?;
 
-            // Process in transaction processor
-            let result = self
-                .transaction_processor
+            let result = self.transaction_processor
                 .process_transaction(transaction)
                 .await?;
 
-            // Update relevant metrics
-            self.update_credit_metrics(&result).await?;
+            self.metrics_tracker.record_transaction(&result).await?;
 
             Ok(result)
         }
 
-        /// Updates the hybrid split ratio based on efficiency metrics
-        pub async fn update_hybrid_split_ratio(
+        async fn validate_transaction(
             &self,
-            group: &CoreGroup,
-            gpu_result: &ProcessingResult,
-            cpu_result: &ProcessingResult,
+            transaction: &CreditTransaction
         ) -> Result<(), CostError> {
-            let gpu_efficiency = self.calculate_processing_efficiency(gpu_result)?;
-            let cpu_efficiency = self.calculate_processing_efficiency(cpu_result)?;
-
-            let cost_factors = self.get_cost_factors(group).await?;
-
-            let new_ratio = WorkSplitRatio::new(gpu_efficiency, cpu_efficiency, cost_factors);
-
-            // Store and validate the new ratio
-            self.validate_and_store_split_ratio(group.id, new_ratio)
-                .await?;
-
-            // Update allocation if needed
-            if self.should_rebalance_allocation(&new_ratio) {
-                self.trigger_allocation_rebalance(group.id).await?;
-            }
-
-            Ok(())
-        }
-
-        /// Calculates costs for individual cores
-        pub async fn calculate_core_costs(&self) -> Result<CoreCosts, CostError> {
-            let mut core_costs = HashMap::new();
-            let metrics = self.metrics_tracker.get_core_metrics().await?;
-
-            for (core_id, core_metrics) in metrics {
-                let base_cost = self.calculate_base_core_cost(&core_metrics);
-                let usage_cost = self.calculate_core_usage_cost(&core_metrics);
-                let efficiency_factor = self.calculate_core_efficiency(&core_metrics);
-
-                core_costs.insert(
-                    core_id,
-                    CoreCost {
-                        base_cost,
-                        usage_cost,
-                        efficiency_factor,
-                        total: base_cost * usage_cost * efficiency_factor,
-                    },
-                );
-            }
-
-            Ok(CoreCosts { costs: core_costs })
-        }
-
-        /// Calculates the total cost for a job
-        pub async fn calculate_job_cost(&self, job_id: JobId) -> Result<JobCost, CostError> {
-            let job_metrics = self.metrics_tracker.get_job_metrics(job_id).await?;
-            let resource_usage = self.get_job_resource_usage(job_id).await?;
-
-            let execution_cost = self
-                .calculate_execution_cost(&job_metrics.workload, &resource_usage)
-                .await?;
-
-            let overhead_cost = self.calculate_job_overhead_cost(&job_metrics).await?;
-
-            Ok(JobCost {
-                execution_cost,
-                overhead_cost,
-                total: execution_cost.total + overhead_cost,
-                breakdown: self.generate_cost_breakdown(&execution_cost, overhead_cost),
-            })
-        }
-
-        // Private helper methods
-        async fn validate_transaction(&self, transaction: &CreditTransaction) -> Result<(), CostError> {
-            // Implement transaction validation logic
             if transaction.amount <= 0.0 {
                 return Err(CostError::InvalidTransaction(
-                    "Amount must be positive".into(),
+                    "Amount must be positive".into()
                 ));
             }
 
-            // Check user balance for withdrawals
             if let TransactionType::Withdrawal = transaction.transaction_type {
-                let current_balance = self.get_user_balance(transaction.user_id).await?;
-                if current_balance < transaction.amount {
+                let balance = self.get_user_balance(transaction.user_id).await?;
+                if balance < transaction.amount {
                     return Err(CostError::InsufficientFunds(format!(
-                        "Current balance {} is less than withdrawal amount {}",
-                        current_balance, transaction.amount
+                        "Balance {} is less than withdrawal amount {}",
+                        balance,
+                        transaction.amount
                     )));
                 }
             }
@@ -1842,59 +1880,38 @@ mod cost {
             Ok(())
         }
 
-        async fn calculate_operational_costs(
-            &self,
-            metrics: &GroupMetrics,
-        ) -> Result<OperationalCosts, CostError> {
-            let base_cost = self.calculate_base_cost(&metrics.resource_usage);
-            let performance_factor = self.calculate_performance_factor(&metrics.performance_metrics);
-            let efficiency_factor = self.calculate_efficiency_factor(&metrics.efficiency_metrics);
-
-            Ok(OperationalCosts {
-                base_cost,
-                adjusted_cost: base_cost * performance_factor * efficiency_factor,
-                performance_factor,
-                efficiency_factor,
-            })
-        }
-
-        fn calculate_efficiency_score(
-            &self,
-            components: &CostComponents,
-            total_cost: f64,
-        ) -> Result<f64, CostError> {
-            if total_cost <= 0.0 {
-                return Err(CostError::CalculationError(
-                    "Total cost must be positive".into(),
-                ));
-            }
-
-            let weighted_efficiency =
-                (components.compute * 0.5 + components.memory * 0.3 + components.network * 0.2)
-                    / total_cost;
-
-            Ok(weighted_efficiency.min(1.0))
-        }
-
-        async fn update_running_metrics(
-            &self,
-            workload_id: WorkloadId,
-            metrics: &CostMetrics,
-        ) -> Result<(), CostError> {
-            let mut stats = self.execution_stats.lock().await;
-
-            stats.update_running_metrics(workload_id, metrics);
-
-            if stats.should_trigger_optimization(self.cost_config.optimization_interval) {
-                self.trigger_cost_optimization().await?;
-            }
+        async fn store_cost_profile(&self, profile: &CostProfile) -> Result<(), CostError> {
+            sqlx::query!(
+                r#"
+                INSERT INTO cost_profiles (
+                    base_compute_unit_cost,
+                    gpu_multiplier,
+                    cpu_multiplier,
+                    scaling_factors,
+                    timestamp
+                ) VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+                "#,
+                profile.base_compute_unit_cost,
+                profile.gpu_multiplier,
+                profile.cpu_multiplier,
+                serde_json::to_value(&profile.scaling_factors)?
+            )
+            .execute(&self.db)
+            .await?;
 
             Ok(())
         }
 
-        async fn trigger_cost_optimization(&self) -> Result<(), CostError> {
-            // Implement optimization trigger logic
-            todo!("Implement cost optimization trigger")
+        async fn get_user_balance(&self, user_id: Uuid) -> Result<f64, CostError> {
+            let balance = sqlx::query!(
+                "SELECT balance FROM user_accounts WHERE id = $1",
+                user_id
+            )
+            .fetch_one(&self.db)
+            .await?
+            .balance;
+
+            Ok(balance)
         }
     }
 }
@@ -1931,6 +1948,14 @@ mod metrics {
         pub worker_id: WorkerId,
         pub error_rate: f64,
         pub throughput: ThroughputMetrics,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct CostMetrics {
+        total_cost: f64,
+        compute_cost: f64,
+        efficiency_score: f64,
+        timestamp: DateTime<Utc>,
     }
 
     #[derive(Debug)]
@@ -1998,6 +2023,53 @@ mod metrics {
 
             Ok(())
         }
+
+        pub async fn track_cost_metrics(
+            &self,
+            workload_id: WorkloadId,
+            components: &CostComponents,
+            total_cost: f64,
+        ) -> Result<(), CostError> {
+            let metrics = CostMetrics {
+                total_cost,
+                compute_cost: components.compute,
+                memory_cost: components.memory,
+                network_cost: components.network,
+                efficiency_score: self.calculate_efficiency_score(components, total_cost)?,
+                timestamp: Utc::now(),
+            };
+
+            // Store in database
+            sqlx::query!(
+                r#"
+                INSERT INTO cost_metrics (
+                    workload_id,
+                    total_cost,
+                    compute_cost,
+                    memory_cost,
+                    network_cost,
+                    efficiency_score,
+                    timestamp
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                "#,
+                workload_id.0,
+                metrics.total_cost,
+                metrics.compute_cost,
+                metrics.memory_cost,
+                metrics.network_cost,
+                metrics.efficiency_score,
+                metrics.timestamp,
+            )
+            .execute(&self.db)
+            .await?;
+
+            // Update in-memory metrics
+            self.update_running_metrics(workload_id, &metrics).await?;
+
+            Ok(())
+        }
+
 
         async fn update_core_metrics(&self, metrics: &JobExecutionMetrics) -> Result<(), MetricsError> {
             for (core_id, core_stats) in &metrics.core_stats {
