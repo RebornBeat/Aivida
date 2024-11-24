@@ -521,13 +521,17 @@ mod resource {
 mod core {
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
-    use std::time::Duration;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+    use uuid::Uuid;
+    use chrono::{DateTime, Utc};
+    use crate::errors::{ProcessingError, CoreError};
+    use crate::metrics::MetricsTracker;
+    use crate::cost::{CostManager, CostProfile};
+    use crate::sample::{Sample, SampleDistribution};
+    use crate::job::{WorkAssignment, JobRequirements};
     use crate::core_identifiers::*;
-    use crate::worker::*;
-    use crate::locality::*;
-    use crate::cost::*;
-    use crate::metrics::*;
-    use crate::job::WorkAssignment;
+    use crate::locality::NetworkLocality;
 
     #[derive(Debug)]
     pub struct ProcessingUnit {
@@ -566,13 +570,163 @@ mod core {
         pub cost_profile: CostProfile,
         pub performance_metrics: GroupPerformanceMetrics,
         pub current_workload: WorkloadStats,
+        pub minimum_required_results: usize,
+        pub max_concurrent_units: usize,
     }
 
     #[derive(Debug, Clone)]
-    pub enum SyncRole {
-        Master,
-        Worker,
-        Aggregator,
+    pub enum ProcessingPattern {
+        WarpBased {
+            warp_size: usize,
+            warps_per_block: usize,
+            credit_cost_per_warp: f64,
+            memory_strategy: MemoryStrategy,
+        },
+        ThreadBased {
+            thread_count: usize,
+            vector_width: usize,
+            credit_cost_per_thread: f64,
+            cache_strategy: CacheStrategy,
+        },
+        Hybrid {
+            gpu_cores: Vec<CoreId>,
+            cpu_cores: Vec<CoreId>,
+            optimal_work_split: WorkSplitRatio,
+            cost_balancing: CostBalanceStrategy,
+            coordination_strategy: CoordinationStrategy,
+        },
+    }
+
+    #[derive(Debug)]
+    pub struct CoreGroupManager {
+        groups: HashMap<GroupId, CoreGroup>,
+        metrics_tracker: Arc<MetricsTracker>,
+        cost_manager: Arc<CostManager>,
+        transition_manager: Arc<TransitionManager>,
+        active_assignments: HashMap<WorkAssignment, GroupId>,
+        group_formation_config: GroupFormationConfig,
+    }
+
+    #[derive(Debug)]
+    pub struct GroupFormationConfig {
+        pub min_group_size: usize,
+        pub max_group_size: usize,
+        pub locality_weight: f64,
+        pub performance_weight: f64,
+        pub cost_weight: f64,
+        pub hybrid_threshold: f64,
+    }
+
+    #[derive(Debug)]
+    pub struct WorkSplitRatio {
+        pub gpu_ratio: f64,
+        pub cpu_ratio: f64,
+        pub threshold: f64,
+        pub adaptation_rate: f64,
+    }
+
+    #[derive(Debug)]
+    pub struct GroupPerformanceMetrics {
+        pub total_throughput: f64,
+        pub average_latency: Duration,
+        pub error_rate: f64,
+        pub efficiency_score: f64,
+        pub cost_efficiency: f64,
+        pub resource_utilization: HashMap<CoreId, f64>,
+    }
+
+    #[derive(Debug)]
+    pub struct WorkloadStats {
+        pub active_samples: usize,
+        pub completed_samples: usize,
+        pub failed_samples: usize,
+        pub average_processing_time: Duration,
+        pub resource_usage: ResourceUsage,
+    }
+
+    #[derive(Debug)]
+    pub enum AllocationStatus {
+        Available,
+        Reserved {
+            job_id: Uuid,
+            reserved_at: DateTime<Utc>,
+            expiration: DateTime<Utc>,
+        },
+        InUse {
+            job_id: Uuid,
+            started_at: DateTime<Utc>,
+            metrics: ExecutionMetrics,
+            current_samples: usize,
+            health_check: HealthStatus,
+        },
+        Maintenance {
+            reason: String,
+            since: DateTime<Utc>,
+            estimated_duration: Duration,
+        },
+    }
+
+    #[derive(Debug)]
+    pub struct ExecutionMetrics {
+        pub samples_processed: usize,
+        pub processing_time: Duration,
+        pub resource_usage: ResourceUsage,
+        pub error_count: usize,
+    }
+
+    #[derive(Debug)]
+    pub enum HealthStatus {
+        Healthy,
+        Degraded { reason: String },
+        Failed { error: String },
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct MemoryStrategy {
+        pub shared_memory_usage: u64,
+        pub cache_policy: CachePolicy,
+        pub coalescing_strategy: CoalescingStrategy,
+        pub prefetch_policy: PrefetchPolicy,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct CacheStrategy {
+        pub cache_levels: Vec<CacheLevel>,
+        pub prefetch_distance: usize,
+        pub write_policy: WritePolicy,
+        pub eviction_policy: EvictionPolicy,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct CoreCapabilities {
+        pub core_type: CoreType,
+        pub performance_profile: PerformanceProfile,
+        pub locality: NetworkLocality,
+        pub cost_profile: CostProfile,
+        pub memory_specs: MemorySpecs,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct PerformanceProfile {
+        pub base_throughput: f64,
+        pub optimal_batch_size: Option<usize>,
+        pub latency_profile: LatencyProfile,
+        pub power_efficiency: f64,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct MemorySpecs {
+        pub total_memory: u64,
+        pub bandwidth: u64,
+        pub cache_size: Option<u64>,
+        pub shared_memory: Option<u64>,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct LatencyProfile {
+        pub compute_latency: Duration,
+        pub memory_latency: Duration,
+        pub network_latency: Duration,
     }
 
     #[derive(Debug)]
@@ -606,118 +760,32 @@ mod core {
         },
     }
 
-    #[derive(Debug, Clone)]
-    pub struct CoreCapabilities {
-        pub core_type: CoreType,
-        pub performance_profile: PerformanceProfile,
-        pub locality: NetworkLocality,
-        pub cost_profile: CostProfile,
-        pub memory_specs: MemorySpecs,
-    }
-
     #[derive(Debug)]
     struct ScoredCore {
         core: CoreId,
         score: f64,
     }
 
-    #[derive(Debug, Clone)]
-    pub struct PerformanceProfile {
-        pub base_throughput: f64,
-        pub optimal_batch_size: Option<usize>,
-        pub latency_profile: LatencyProfile,
-        pub power_efficiency: f64,
-    }
-
-    #[derive(Debug, Clone)]
-    pub struct LatencyProfile {
-        pub compute_latency: Duration,
-        pub memory_latency: Duration,
-        pub network_latency: Duration,
-    }
-
-    #[derive(Debug, Clone)]
-    pub struct MemorySpecs {
-        pub total_memory: u64,
-        pub bandwidth: u64,
-        pub cache_size: Option<u64>,
-        pub shared_memory: Option<u64>,
-    }
-
-    #[derive(Debug)]
-    pub struct CoreAllocation {
-        pub core_id: CoreId,
-        pub worker_id: WorkerId,
-        pub capabilities: CoreCapabilities,
-        pub current_load: f32,
-        pub processing_pattern: ProcessingPattern,
-        pub optimal_batch_size: Option<usize>,
-        pub allocation_status: AllocationStatus,
-        pub performance_metrics: PerformanceMetrics,
-    }
-
-    #[derive(Debug)]
-    pub enum AllocationStatus {
-        Available,
-        Reserved {
-            job_id: Uuid,
-            reserved_at: DateTime<Utc>,
-            expiration: DateTime<Utc>,
-        },
-        InUse {
-            job_id: Uuid,
-            started_at: DateTime<Utc>,
-            metrics: ExecutionMetrics,
-            current_samples: usize,
-            health_check: HealthStatus,
-        },
-        Maintenance {
-            reason: String,
-            since: DateTime<Utc>,
-            estimated_duration: Duration,
-        },
-    }
-
-    #[derive(Debug, Clone)]
-    pub enum ProcessingPattern {
-        WarpBased {
-            warp_size: usize,
-            warps_per_block: usize,
-            credit_cost_per_warp: f64,
-            memory_strategy: MemoryStrategy,
-        },
-        ThreadBased {
-            thread_count: usize,
-            vector_width: usize,
-            credit_cost_per_thread: f64,
-            cache_strategy: CacheStrategy,
-        },
-        Hybrid {
-            gpu_cores: Vec<CoreId>,
-            cpu_cores: Vec<CoreId>,
-            optimal_work_split: WorkSplitRatio,
-            cost_balancing: CostBalanceStrategy,
-            coordination_strategy: CoordinationStrategy,
-        },
-    }
-
-    #[derive(Debug, Clone)]
-    pub struct MemoryStrategy {
-        pub shared_memory_usage: u64,
-        pub cache_policy: CachePolicy,
-        pub coalescing_strategy: CoalescingStrategy,
-        pub prefetch_policy: PrefetchPolicy,
-    }
-
-    #[derive(Debug, Clone)]
-    pub struct CacheStrategy {
-        pub cache_levels: Vec<CacheLevel>,
-        pub prefetch_distance: usize,
-        pub write_policy: WritePolicy,
-        pub eviction_policy: EvictionPolicy,
-    }
-
     impl CoreGroup {
+        pub fn new(
+            id: GroupId,
+            cores: Vec<CoreId>,
+            pattern: ProcessingPattern,
+            locality: NetworkLocality,
+        ) -> Self {
+            Self {
+                id,
+                cores,
+                processing_pattern: pattern,
+                network_locality: locality,
+                cost_profile: CostProfile::default(),
+                performance_metrics: GroupPerformanceMetrics::default(),
+                current_workload: WorkloadStats::default(),
+                minimum_required_results: cores.len() / 2 + 1, // Configurable
+                max_concurrent_units: cores.len() * 2, // Configurable
+            }
+        }
+
         pub async fn execute_workload(
             &self,
             work_unit: WorkUnit,
@@ -840,6 +908,15 @@ mod core {
                 .await?;
 
             Ok(merged_result)
+        }
+
+        // Helper methods for processing
+        async fn setup_execution_monitor(&self, group_id: GroupId) -> ExecutionMonitor {
+            ExecutionMonitor::new(
+                group_id,
+                self.metrics_tracker.clone(),
+                self.monitor_config.clone(),
+            )
         }
 
         fn optimize_batch_size(&self, current_size: usize, result: &BatchResult) -> usize {
@@ -996,19 +1073,149 @@ mod core {
                 current_load: 0.0,
                 performance_metrics: PerformanceMetrics::default(),
                 cost_profile: CostProfile::default(),
+                current_assignment: None,
             }
         }
 
-        fn allocate(&mut self, job_id: Uuid) -> Result<(), AllocationError> {
-            // ...
+        pub fn get_compute_power(&self) -> f64 {
+            match &self.core_type {
+                CoreType::CUDA { compute_capability, warp_size, shared_memory, .. } => {
+                    compute_capability * (*warp_size as f32) *
+                    (1.0 + (*shared_memory as f32 / 1024.0 / 1024.0)) as f64
+                },
+                CoreType::CPU { frequency, simd_width, cache_size, .. } => {
+                    frequency * (*simd_width.unwrap_or(&1) as f64) *
+                    (1.0 + (*cache_size as f64 / 1024.0 / 1024.0))
+                }
+            }
         }
 
-        fn execute_work(&mut self, work: &WorkUnit) -> Result<WorkResult, ExecutionError> {
-            // ...
+        pub async fn assign_work(
+            &mut self,
+            assignment: WorkAssignment
+        ) -> Result<(), ProcessingError> {
+            if self.current_assignment.is_some() {
+                return Err(ProcessingError::ResourceAllocation(
+                    "Core already has assigned work".into()
+                ));
+            }
+
+            self.validate_assignment_requirements(&assignment)?;
+            self.current_assignment = Some(assignment);
+            self.current_load = 0.0;
+            Ok(())
+        }
+
+        pub async fn process_samples(
+            &mut self,
+            samples: &[Sample],
+            memory_manager: &MemoryManager,
+        ) -> Result<ProcessingResult, ProcessingError> {
+            match &self.core_type {
+                CoreType::CUDA { .. } => {
+                    self.process_gpu_samples(samples, memory_manager).await
+                },
+                CoreType::CPU { .. } => {
+                    self.process_cpu_samples(samples, memory_manager).await
+                }
+            }
+        }
+
+        async fn process_gpu_samples(
+            &self,
+            samples: &[Sample],
+            memory_manager: &MemoryManager,
+        ) -> Result<ProcessingResult, ProcessingError> {
+            let cuda_context = self.init_cuda_context()?;
+            let batch_size = self.calculate_optimal_batch_size(samples.len())?;
+
+            let results = stream::iter(samples.chunks(batch_size))
+                .map(|batch| {
+                    let context = cuda_context.clone();
+                    async move {
+                        self.process_gpu_batch(batch, &context, memory_manager).await
+                    }
+                })
+                .buffer_unordered(self.capabilities.max_concurrent_batches)
+                .collect::<Vec<_>>()
+                .await;
+
+            self.aggregate_results(results)
+        }
+
+        async fn process_cpu_samples(
+            &self,
+            samples: &[Sample],
+            memory_manager: &MemoryManager,
+        ) -> Result<ProcessingResult, ProcessingError> {
+            let simd_context = self.init_simd_context()?;
+            let cache_strategy = self.create_cache_strategy()?;
+
+            let partitions = self.create_cache_aware_partitions(
+                samples,
+                &cache_strategy
+            )?;
+
+            let results = self.thread_pool
+                .scoped(|scope| {
+                    partitions.into_iter()
+                        .map(|partition| {
+                            scope.spawn(async move {
+                                self.process_cpu_partition(
+                                    partition,
+                                    &simd_context,
+                                    memory_manager
+                                ).await
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await?;
+
+            self.aggregate_results(results)
+        }
+
+        fn calculate_optimal_batch_size(&self, total_samples: usize) -> Result<usize, ProcessingError> {
+            match &self.core_type {
+                CoreType::CUDA { warp_size, .. } => {
+                    let base_size = warp_size * 32; // Standard CUDA warp size
+                    Ok((base_size..=base_size * 4)
+                        .find(|&size| size >= total_samples)
+                        .unwrap_or(base_size))
+                },
+                CoreType::CPU { simd_width, cache_size, .. } => {
+                    let width = simd_width.unwrap_or(1);
+                    let cache_optimal = cache_size / std::mem::size_of::<Sample>();
+                    Ok(width * (cache_optimal.min(total_samples)))
+                }
+            }
+        }
+
+        async fn monitor_health(&self) -> Result<CoreHealth, ProcessingError> {
+            let metrics = self.performance_metrics.clone();
+
+            if metrics.error_rate > self.thresholds.max_error_rate {
+                return Ok(CoreHealth::Failed {
+                    error: format!("Error rate {} exceeds threshold", metrics.error_rate)
+                });
+            }
+
+            // Other health checks
+            Ok(CoreHealth::Healthy)
+        }
+
+        async fn handle_failure(&mut self) -> Result<(), ProcessingError> {
+            // Handle failure at core level
+            if let Some(assignment) = &self.current_assignment {
+                self.return_work_to_queue(assignment)?;
+            }
+
+            self.status = CoreStatus::Failed;
+            Ok(())
         }
     }
 
-    impl CoreManager {
+    impl CoreGroupManager {
         pub async fn new(config: CoreManagerConfig) -> Result<Self, CoreError> {
             Ok(Self {
                 worker_core_map: HashMap::new(),
@@ -1021,301 +1228,281 @@ mod core {
             })
         }
 
-        async fn create_distribution(
+        pub async fn create_group_for_job(
+            &mut self,
+            job_requirements: &JobRequirements,
+            available_cores: &[ProcessingUnit],
+        ) -> Result<CoreGroup, ProcessingError> {
+            // Score and select cores based on requirements
+            let scored_cores = self.score_cores_for_job(available_cores, job_requirements).await?;
+
+            // Determine optimal group composition
+            let (selected_cores, pattern) = self.determine_group_composition(
+                scored_cores,
+                job_requirements
+            ).await?;
+
+            // Create the group
+            let group_id = GroupId(Uuid::new_v4());
+            let worker_id = selected_cores[0].worker_id; // All cores should be from same worker
+
+            let group = CoreGroup::new(
+                group_id,
+                selected_cores.iter().map(|c| c.id).collect(),
+                worker_id,
+                pattern,
+                self.calculate_group_locality(&selected_cores)?,
+            );
+
+            // Register group
+            self.groups.insert(group_id, group.clone());
+
+            Ok(group)
+        }
+
+        async fn score_cores_for_job(
             &self,
-            samples: Vec<Sample>,
-            hints: &OptimizationHints,
-        ) -> Result<SampleDistribution, ProcessingError> {
-            // Analyze locality requirements
-            let locality_map = self.analyze_locality(&samples, hints)?;
+            cores: &[ProcessingUnit],
+            requirements: &JobRequirements,
+        ) -> Result<Vec<ScoredCore>, ProcessingError> {
+            let mut scored_cores = Vec::new();
 
-            // Group samples by requirements and locality
-            let sample_groups = self.group_samples_by_affinity(&samples, &locality_map)?;
+            for core in cores {
+                if !self.meets_basic_requirements(core, requirements)? {
+                    continue;
+                }
 
-            // Create initial distribution
-            let mut distribution = SampleDistribution::new();
+                let core_metrics = metrics.core_metrics.get(&core.id)
+                    .ok_or_else(|| ProcessingError::Metrics("Core metrics not found".into()))?;
 
-            // Assign cores based on requirements and locality
-            for group in sample_groups {
-                let cores = self.find_optimal_cores(&group, hints).await?;
+                // Handle utilization as part of scoring
+                if core_metrics.utilization > self.config.high_utilization_threshold {
+                    continue; // Skip overutilized cores
+                }
 
-                distribution.add_allocation(group, cores)?;
+                let performance_score = self.calculate_performance_score(core).await?;
+                let cost_score = self.calculate_cost_score(core).await?;
+                let locality_score = self.calculate_locality_score(core).await?;
+
+                let total_score =
+                    performance_score * self.group_formation_config.performance_weight +
+                    cost_score * self.group_formation_config.cost_weight +
+                    locality_score * self.group_formation_config.locality_weight;
+
+                scored_cores.push(ScoredCore {
+                    core: core.clone(),
+                    score: total_score,
+                });
             }
 
-            Ok(distribution)
+            scored_cores.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+            Ok(scored_cores)
         }
 
-        // Helper methods for work distribution
-        async fn find_optimal_cores(
+        async fn calculate_performance_score(&self, core: &ProcessingUnit) -> Result<f64, ProcessingError> {
+            let metrics = self.metrics_tracker.get_core_metrics(core.id).await?;
+
+            let throughput_score = metrics.compute_throughput / core.capabilities.performance_profile.base_throughput;
+            let efficiency_score = metrics.efficiency;
+            let error_rate_penalty = (1.0 - metrics.error_rate).max(0.0);
+
+            Ok(throughput_score * efficiency_score * error_rate_penalty)
+        }
+
+        async fn calculate_cost_score(&self, core: &ProcessingUnit) -> Result<f64, ProcessingError> {
+            let cost_efficiency = self.cost_manager.calculate_core_cost_efficiency(core).await?;
+            let utilization = core.current_load;
+
+            // Higher score for cost-efficient, well-utilized cores
+            Ok(cost_efficiency * (1.0 - utilization))
+        }
+
+        async fn calculate_locality_score(&self, core: &ProcessingUnit) -> Result<f64, ProcessingError> {
+            let locality = &core.capabilities.locality;
+            let network_score = locality.connection_quality.reliability_score;
+            let latency_score = self.calculate_latency_score(&locality.latency_stats);
+
+            Ok(network_score * latency_score)
+        }
+
+        async fn determine_group_composition(
             &self,
-            group: &SampleGroup,
-            hints: &OptimizationHints,
-        ) -> Result<Vec<CoreAllocation>, ProcessingError> {
-            let requirements = self.derive_core_requirements(group, hints)?;
-
-            let available_cores = self.find_eligible_cores(&requirements).await?;
-
-            self.allocate_cores(available_cores, &requirements).await
+            scored_cores: Vec<ScoredCore>,
+            requirements: &JobRequirements,
+        ) -> Result<(Vec<ProcessingUnit>, ProcessingPattern), ProcessingError> {
+            // Check if hybrid processing would be beneficial
+            if self.should_use_hybrid_processing(&scored_cores, requirements)? {
+                self.create_hybrid_group(scored_cores, requirements).await
+            } else {
+                self.create_homogeneous_group(scored_cores, requirements).await
+            }
         }
 
-        pub async fn optimize_core_distribution(&self) -> Result<Distribution, CoreError> {
-            let current_allocation = self.get_current_allocation().await?;
-            let metrics = self.metrics_tracker.get_current_metrics().await?;
+        fn should_use_hybrid_processing(
+            &self,
+            cores: &[ScoredCore],
+            requirements: &JobRequirements,
+        ) -> Result<bool, ProcessingError> {
+            // Calculate potential benefits of hybrid processing
+            let gpu_cores: Vec<_> = cores.iter()
+                .filter(|c| matches!(c.core.core_type, CoreType::CUDA { .. }))
+                .collect();
 
-            // Identify underutilized and overutilized cores
-            let (underutilized, overutilized) =
-                self.identify_imbalanced_cores(&current_allocation, &metrics)?;
+            let cpu_cores: Vec<_> = cores.iter()
+                .filter(|c| matches!(c.core.core_type, CoreType::CPU { .. }))
+                .collect();
 
-            // Calculate optimal redistribution
-            let redistribution = self.calculate_redistribution(&underutilized, &overutilized)?;
+            if gpu_cores.is_empty() || cpu_cores.is_empty() {
+                return Ok(false);
+            }
 
-            // Apply changes gradually
-            self.apply_redistribution(redistribution).await?;
+            // Check if workload characteristics favor hybrid processing
+            let hybrid_benefit = self.calculate_hybrid_benefit(
+                &gpu_cores,
+                &cpu_cores,
+                requirements
+            )?;
 
-            Ok(self.get_updated_distribution().await?)
+            Ok(hybrid_benefit > self.group_formation_config.hybrid_threshold)
         }
 
-        pub async fn handle_core_failure(&self, core_id: CoreId) -> Result<(), CoreError> {
-            // Mark core as failed
-            self.mark_core_failed(core_id).await?;
+        async fn create_hybrid_group(
+            &self,
+            scored_cores: Vec<ScoredCore>,
+            requirements: &JobRequirements,
+        ) -> Result<(Vec<ProcessingUnit>, ProcessingPattern), ProcessingError> {
+            // Split cores into GPU and CPU groups
+            let (gpu_cores, cpu_cores): (Vec<_>, Vec<_>) = scored_cores.into_iter()
+                .map(|sc| sc.core)
+                .partition(|c| matches!(c.core_type, CoreType::CUDA { .. }));
 
-            // Get affected workload
-            let affected_work = self.get_affected_work(core_id).await?;
+            // Calculate initial split ratio
+            let split_ratio = self.calculate_initial_split_ratio(&gpu_cores, &cpu_cores)?;
 
-            // Redistribute work
-            let new_allocation = self.redistribute_work(affected_work).await?;
+            // Create hybrid pattern
+            let pattern = ProcessingPattern::Hybrid {
+                gpu_cores: gpu_cores.iter().map(|c| c.id).collect(),
+                cpu_cores: cpu_cores.iter().map(|c| c.id).collect(),
+                optimal_work_split: split_ratio,
+                cost_balancing: self.create_cost_balance_strategy()?,
+                coordination_strategy: self.determine_coordination_strategy(requirements)?,
+            };
 
-            // Update system state
-            self.apply_new_allocation(new_allocation).await?;
+            let mut selected_cores = Vec::new();
+            selected_cores.extend(gpu_cores);
+            selected_cores.extend(cpu_cores);
+
+            Ok((selected_cores, pattern))
+        }
+
+        async fn create_homogeneous_group(
+            &self,
+            scored_cores: Vec<ScoredCore>,
+            requirements: &JobRequirements,
+        ) -> Result<(Vec<ProcessingUnit>, ProcessingPattern), ProcessingError> {
+            let cores: Vec<ProcessingUnit> = scored_cores.into_iter()
+                .map(|sc| sc.core)
+                .take(self.group_formation_config.max_group_size)
+                .collect();
+
+            let pattern = match cores[0].core_type {
+                CoreType::CUDA { .. } => self.create_warp_pattern(&cores, requirements)?,
+                CoreType::CPU { .. } => self.create_thread_pattern(&cores, requirements)?,
+            };
+
+            Ok((cores, pattern))
+        }
+
+        pub async fn assign_work(
+            &mut self,
+            group_id: GroupId,
+            assignment: WorkAssignment,
+        ) -> Result<(), ProcessingError> {
+            let group = self.groups.get_mut(&group_id)
+                .ok_or_else(|| ProcessingError::ResourceAllocation("Group not found".into()))?;
+
+            // Validate assignment
+            self.validate_assignment(group, &assignment)?;
+
+            // Record assignment
+            self.active_assignments.insert(assignment.clone(), group_id);
+
+            // Update group workload stats
+            group.current_workload.active_samples += assignment.samples.len();
 
             Ok(())
         }
 
-        async fn monitor_core_performance(&self) -> Result<(), MonitorError> {
-            loop {
-                let metrics = self.metrics_tracker.get_current_metrics().await?;
+        pub async fn monitor_groups(&self) -> Result<(), ProcessingError> {
+            for group in self.groups.values() {
+                let metrics = self.metrics_tracker.get_group_metrics(group.id).await?;
 
-                // Check for failures
-                for (core_id, core_metrics) in &metrics.core_metrics {
-                    if self.is_core_failing(core_id, core_metrics) {
-                        self.handle_core_failure(*core_id).await?;
-                    }
+                // Check for performance issues
+                if metrics.efficiency_score < self.group_formation_config.performance_threshold {
+                    self.handle_low_performance(group, &metrics).await?;
                 }
 
-                // Check for rebalancing needs
-                if self.needs_rebalancing(&metrics) {
-                    self.rebalance_workload().await?;
-                }
+                // Check for cost efficiency
+                let cost_efficiency = self.cost_manager
+                    .calculate_group_cost_efficiency(group.id)
+                    .await?;
 
-                sleep(Duration::from_secs(self.monitor_interval)).await;
+                if cost_efficiency < self.group_formation_config.cost_threshold {
+                    self.handle_cost_inefficiency(group, cost_efficiency).await?;
+                }
             }
+
+            Ok(())
         }
 
-        pub async fn rebalance_workload(&self) -> Result<(), CoreError> {
-            let current_state = self.get_current_state().await?;
+        async fn handle_low_performance(
+            &self,
+            group: &CoreGroup,
+            metrics: &GroupPerformanceMetrics,
+        ) -> Result<(), ProcessingError> {
+            // Create transition plan
+            let plan = self.transition_manager
+                .create_performance_improvement_plan(group, metrics)
+                .await?;
 
-            // Calculate optimal distribution
-            let target_distribution = self.calculate_optimal_distribution(&current_state)?;
+            // Execute transition
+            self.execute_transition_plan(plan).await?;
 
-            // Generate transition plan
-            let transition_plan = self.create_transition_plan(&current_state, &target_distribution)?;
+            Ok(())
+        }
 
-            // Execute transitions
-            for step in transition_plan.steps {
-                self.execute_transition_step(step).await?;
+        async fn handle_cost_inefficiency(
+            &self,
+            group: &CoreGroup,
+            efficiency: f64,
+        ) -> Result<(), ProcessingError> {
+            // Create optimization plan
+            let plan = self.transition_manager
+                .create_cost_optimization_plan(group, efficiency)
+                .await?;
 
-                // Verify stability after each step
+            // Execute transition
+            self.execute_transition_plan(plan).await?;
+
+            Ok(())
+        }
+
+        async fn execute_transition_plan(
+            &self,
+            plan: TransitionPlan,
+        ) -> Result<(), ProcessingError> {
+            for step in plan.steps {
+                // Execute step with rollback support
+                if let Err(e) = self.execute_transition_step(&step).await {
+                    self.rollback_transition(&step).await?;
+                    return Err(e);
+                }
+
+                // Verify stability after step
                 self.verify_system_stability().await?;
             }
 
             Ok(())
-        }
-
-        pub async fn process_workload(
-            &self,
-            workload: Workload,
-            hints: &OptimizationHints,
-        ) -> Result<ProcessingResult, ProcessingError> {
-            // Step 1: Create optimal distribution
-            let distribution = self.create_distribution(workload.samples, hints).await?;
-
-            // Step 2: Form processing groups with advanced monitoring
-            let processing_groups = self.form_processing_groups(&distribution).await?;
-            let execution_monitor = Arc::new(ExecutionMonitor::new(
-                processing_groups.iter().map(|g| g.id).collect(),
-                self.metrics_tracker.clone(),
-                self.monitor_config.clone(),
-            ));
-
-            // Step 3: Process groups with enhanced error handling and monitoring
-            let results = stream::iter(processing_groups)
-                .map(|group| {
-                    let monitor = execution_monitor.clone();
-                    async move {
-                        let execution_id = monitor.start_group_execution(&group).await?;
-
-                        // Get work units for this group with locality awareness
-                        let work_units = self.get_group_work_units(group.id, &distribution)?;
-
-                        // Process work units with advanced monitoring and error handling
-                        let result = self
-                            .process_group_work_units(group, work_units, &monitor)
-                            .await;
-
-                        // Record completion metrics regardless of success/failure
-                        monitor
-                            .complete_group_execution(execution_id, &result)
-                            .await?;
-
-                        result
-                    }
-                })
-                .buffer_unordered(self.max_concurrent_groups)
-                .collect::<Vec<_>>()
-                .await;
-
-            // Step 4: Validate and aggregate results
-            self.validate_and_aggregate_results(results, &execution_monitor)
-                .await
-        }
-
-        async fn process_group_work_units(
-            &self,
-            group: CoreGroup,
-            work_units: Vec<WorkUnit>,
-            monitor: &Arc<ExecutionMonitor>,
-        ) -> Result<GroupResult, ProcessingError> {
-            // Initialize resources with proper cleanup handling
-            let memory_manager = self
-                .init_memory_manager(&group.processing_pattern)
-                .map_err(|e| ProcessingError::MemoryInitialization(e.to_string()))?;
-
-            let processing_config =
-                self.create_processing_config(&group, &self.topology.get_locality_map());
-
-            // Process work units with advanced error handling and monitoring
-            let results = stream::iter(work_units)
-                .map(|unit| {
-                    let unit_monitor = UnitMonitor::new(monitor.clone(), unit.id);
-                    async move {
-                        let start_time = Instant::now();
-
-                        // Execute work unit with comprehensive error handling
-                        let result = match group
-                            .execute_workload(unit, &memory_manager, &processing_config)
-                            .await
-                        {
-                            Ok(r) => r,
-                            Err(e) => {
-                                unit_monitor.record_failure(e.clone()).await?;
-                                return Err(e);
-                            }
-                        };
-
-                        // Record success metrics
-                        unit_monitor
-                            .record_success(result.clone(), start_time.elapsed())
-                            .await?;
-
-                        Ok(result)
-                    }
-                })
-                .buffer_unordered(group.max_concurrent_units)
-                .collect::<Vec<_>>()
-                .await;
-
-            // Cleanup resources
-            memory_manager.cleanup().await?;
-
-            // Aggregate results with error handling
-            self.aggregate_group_results(results, group)
-        }
-
-        async fn validate_and_aggregate_results(
-            &self,
-            group_results: Vec<Result<GroupResult, ProcessingError>>,
-            monitor: &Arc<ExecutionMonitor>,
-        ) -> Result<ProcessingResult, ProcessingError> {
-            let mut successful_results = Vec::new();
-            let mut failed_groups = Vec::new();
-
-            // Separate successful and failed results
-            for result in group_results {
-                match result {
-                    Ok(group_result) => successful_results.push(group_result),
-                    Err(e) => failed_groups.push(e),
-                }
-            }
-
-            // Check if we have enough successful results to meet requirements
-            if !self.meets_minimum_success_criteria(&successful_results) {
-                return Err(ProcessingError::Execution(format!(
-                    "Insufficient successful groups. Failed groups: {}",
-                    failed_groups.len()
-                )));
-            }
-
-            // Combine successful results
-            let combined_result = self.combine_group_results(successful_results)?;
-
-            // Record final metrics
-            monitor.record_final_metrics(&combined_result).await?;
-
-            Ok(combined_result)
-        }
-
-        fn meets_minimum_success_criteria(&self, results: &[GroupResult]) -> bool {
-            // Implement your success criteria here
-            // Example: At least 70% of groups must succeed
-            let success_ratio = results.len() as f32 / self.min_required_groups as f32;
-            success_ratio >= 0.7
-        }
-
-        async fn aggregate_group_results(
-            &self,
-            results: Vec<Result<WorkResult, ProcessingError>>,
-            group: CoreGroup,
-        ) -> Result<GroupResult, ProcessingError> {
-            let mut successful_results = Vec::new();
-            let mut errors = Vec::new();
-
-            // Process results with error collection
-            for result in results {
-                match result {
-                    Ok(r) => successful_results.push(r),
-                    Err(e) => errors.push(e),
-                }
-            }
-
-            // Check if we have enough successful results
-            if successful_results.len() < group.minimum_required_results {
-                return Err(ProcessingError::Execution(format!(
-                    "Insufficient successful results: {}/{} required. Errors: {:?}",
-                    successful_results.len(),
-                    group.minimum_required_results,
-                    errors
-                )));
-            }
-
-            // Combine successful results
-            Ok(GroupResult {
-                data: self.combine_work_results(&successful_results)?,
-                metrics: self.aggregate_metrics(&successful_results, &errors),
-                errors: if errors.is_empty() {
-                    None
-                } else {
-                    Some(errors)
-                },
-            })
-        }
-
-        // Helper methods for processing
-        async fn setup_execution_monitor(&self, group_id: GroupId) -> ExecutionMonitor {
-            ExecutionMonitor::new(
-                group_id,
-                self.metrics_tracker.clone(),
-                self.monitor_config.clone(),
-            )
         }
     }
 }
@@ -1324,12 +1511,17 @@ mod job {
     use serde::{Deserialize, Serialize};
     use uuid::Uuid;
     use chrono::{DateTime, Utc};
+    use std::collections::HashMap;
+    use std::sync::Arc;
     use crate::metrics::JobMetrics;
-    use crate::core_identifiers::;
-    use crate::security::;
-    use crate::core::;
-    use crate::sample::;
-    use crate::cost::*;
+    use crate::core::{CoreGroup, CoreType, ProcessingPattern};
+    use crate::core_identifiers::*;
+    use crate::security::SecurityLevel;
+    use crate::sample::{Sample, SampleDistribution};
+    use crate::analysis::{JobAnalysis, OptimizationHints};
+    use crate::errors::ProcessingError;
+    use crate::cost::CostConstraints;
+    use crate::locality::LocalityRequirements;
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct ComputeJob {
