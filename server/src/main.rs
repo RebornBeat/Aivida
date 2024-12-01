@@ -532,6 +532,20 @@ mod core {
     use crate::job::{WorkAssignment, JobRequirements};
     use crate::core_identifiers::*;
     use crate::locality::NetworkLocality;
+    use crate::memory::{MemoryManager, SharedMemoryAccess, SharedMemoryManager};
+    use crate::optimization::{OptimizationHints, ResourceOptimizer};
+
+    #[derive(Debug)]
+    pub struct CoreGroup {
+        pub id: GroupId,
+        pub processing_units: Vec<ProcessingUnit>,
+        pub shared_memory_manager: SharedMemoryManager,
+        pub batch_coordinator: BatchCoordinator,
+        pub processing_pattern: ProcessingPattern,
+        pub network_locality: NetworkLocality,
+        pub cost_profile: CostProfile,
+        pub performance_metrics: GroupPerformanceMetrics,
+    }
 
     #[derive(Debug)]
     pub struct ProcessingUnit {
@@ -539,9 +553,60 @@ mod core {
         pub core_type: CoreType,
         pub capabilities: CoreCapabilities,
         pub current_load: f32,
+        pub shared_memory_access: Option<SharedMemoryAccess>,
+        pub batch_context: Option<BatchContext>,
+        pub metrics: UnitMetrics,
+        pub status: CoreStatus,
         pub performance_metrics: PerformanceMetrics,
         pub cost_profile: CostProfile,
-        pub current_assignment: Option<WorkAssignment>,
+    }
+
+    #[derive(Debug)]
+    pub struct SharedMemoryManager {
+        pub total_memory: u64,
+        pub segments: HashMap<SegmentId, SharedSegment>,
+        pub allocations: HashMap<CoreId, Vec<SegmentId>>,
+    }
+
+    #[derive(Debug)]
+    pub struct SharedSegment {
+        pub id: SegmentId,
+        pub data: Arc<RwLock<Vec<u8>>>,
+        pub size: usize,
+        pub access_type: AccessType,
+        pub users: HashSet<CoreId>,
+    }
+
+    #[derive(Debug)]
+    pub enum AccessType {
+        ReadOnly,
+        ReadWrite,
+        Exclusive,
+    }
+
+    #[derive(Debug)]
+    pub struct BatchContext {
+        pub id: BatchId,
+        pub input_tensors: Vec<Tensor>,
+        pub shared_memory: Arc<SharedMemoryAccess>,
+        pub processing_config: ProcessingConfig,
+        pub metrics: BatchMetrics,
+    }
+
+    #[derive(Debug)]
+    pub struct BatchCoordinator {
+        pub active_batches: HashMap<BatchId, BatchState>,
+        pub queue: VecDeque<BatchContext>,
+        pub completed: Vec<BatchResult>,
+    }
+
+    #[derive(Debug)]
+    pub struct BatchState {
+        pub id: BatchId,
+        pub assigned_units: HashMap<CoreId, UnitState>, // Number of processing units working together
+        pub shared_memory: Arc<SharedMemoryAccess>,
+        pub start_time: DateTime<Utc>,
+        pub progress: f32,
     }
 
     #[derive(Debug)]
@@ -561,18 +626,33 @@ mod core {
     }
 
     #[derive(Debug)]
-    pub struct CoreGroup {
-        pub id: GroupId,
-        pub cores: Vec<CoreId>,
-        pub worker_id: WorkerId,
-        pub processing_pattern: ProcessingPattern,
-        pub network_locality: NetworkLocality,
-        pub cost_profile: CostProfile,
-        pub performance_metrics: GroupPerformanceMetrics,
-        pub current_workload: WorkloadStats,
-        pub minimum_required_results: usize,
-        pub max_concurrent_units: usize,
+    pub enum CoreStatus {
+        Available,
+        Processing {
+            batch_id: BatchId,
+            progress: f32,
+        },
+        Failed {
+            error: String,
+            recoverable: bool,
+        },
+        Maintenance,
     }
+
+    #[derive(Debug)]
+    pub enum GroupStatus {
+        Initializing,
+        Ready,
+        Processing {
+            total_batches: usize,
+            completed_batches: usize,
+        },
+        Failed {
+            error: String,
+            failed_units: Vec<CoreId>,
+        },
+    }
+
 
     #[derive(Debug, Clone)]
     pub enum ProcessingPattern {
@@ -636,15 +716,6 @@ mod core {
     }
 
     #[derive(Debug)]
-    pub struct WorkloadStats {
-        pub active_samples: usize,
-        pub completed_samples: usize,
-        pub failed_samples: usize,
-        pub average_processing_time: Duration,
-        pub resource_usage: ResourceUsage,
-    }
-
-    #[derive(Debug)]
     pub enum AllocationStatus {
         Available,
         Reserved {
@@ -681,20 +752,45 @@ mod core {
         Failed { error: String },
     }
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug)]
     pub struct MemoryStrategy {
-        pub shared_memory_usage: u64,
-        pub cache_policy: CachePolicy,
-        pub coalescing_strategy: CoalescingStrategy,
+        pub allocation_policy: AllocationPolicy,
+        pub caching_strategy: CachingStrategy,
         pub prefetch_policy: PrefetchPolicy,
     }
 
-    #[derive(Debug, Clone)]
-    pub struct CacheStrategy {
-        pub cache_levels: Vec<CacheLevel>,
-        pub prefetch_distance: usize,
-        pub write_policy: WritePolicy,
+    #[derive(Debug)]
+    pub enum AllocationPolicy {
+        Static {
+            size: usize,
+        },
+        Dynamic {
+            initial: usize,
+            max: usize,
+            growth_factor: f32,
+        },
+        Adaptive {
+            min: usize,
+            max: usize,
+            usage_threshold: f32,
+        },
+    }
+
+    #[derive(Debug)]
+    pub struct CachingStrategy {
+        pub cache_size: usize,
         pub eviction_policy: EvictionPolicy,
+        pub prefetch_size: usize,
+    }
+
+    #[derive(Debug)]
+    pub enum EvictionPolicy {
+        LRU,
+        LFU,
+        FIFO,
+        Adaptive {
+            metrics: Arc<MetricsTracker>,
+        },
     }
 
     #[derive(Debug, Clone)]
@@ -781,133 +877,424 @@ mod core {
                 cost_profile: CostProfile::default(),
                 performance_metrics: GroupPerformanceMetrics::default(),
                 current_workload: WorkloadStats::default(),
-                minimum_required_results: cores.len() / 2 + 1, // Configurable
-                max_concurrent_units: cores.len() * 2, // Configurable
+                minimum_required_results: cores.len() / 2 + 1,
+                max_concurrent_units: cores.len() * 2,
             }
         }
 
-        pub async fn execute_workload(
-            &self,
-            work_unit: WorkUnit,
-            memory_manager: &MemoryManager,
-            config: &ProcessingConfig,
+        // Primary work processing entry point
+        pub async fn process_work_assignment(
+            &mut self,
+            mode: ProcessingMode,
+            assignment: WorkAssignment,
         ) -> Result<WorkResult, ProcessingError> {
-            match &self.processing_pattern {
-                ProcessingPattern::Hybrid {
-                    gpu_cores,
-                    cpu_cores,
-                    optimal_work_split,
-                    cost_balancing,
-                    coordination_strategy,
-                } => {
-                    // Split work between GPU and CPU cores based on optimal ratio
-                    let (gpu_work, cpu_work) = self.split_work_unit(work_unit, optimal_work_split)?;
+            // Initialize metrics for this assignment
+            self.metrics_tracker.start_assignment(&assignment.id);
 
-                    // Execute in parallel with cost awareness
-                    let (gpu_result, cpu_result) = join!(
-                        self.execute_gpu_work(gpu_work, gpu_cores, memory_manager),
-                        self.execute_cpu_work(cpu_work, cpu_cores, memory_manager)
-                    );
-
-                    // Merge results with cost optimization
-                    self.merge_hybrid_results(gpu_result?, cpu_result?, cost_balancing)
-                }
-                _ => {
-                    self.execute_standard_work(work_unit, memory_manager, config)
-                        .await
-                }
-            }
-        }
-
-        async fn process_warp_based(
-            &self,
-            group: &CoreGroup,
-            distribution: &SampleDistribution,
-        ) -> Result<GroupResult, ProcessingError> {
-            let samples = self.get_group_samples(group.id, distribution)?;
-            let warp_config = self.create_warp_config(group)?;
-
-            // Initialize memory management with error recovery
-            let memory_manager = self
-                .init_memory_manager(&warp_config)
-                .map_err(|e| ProcessingError::MemoryInitialization(e.to_string()))?;
-
-            // Set up monitoring
-            let monitor = self.setup_execution_monitor(group.id);
-
-            // Process with backpressure and adaptive batch sizing
-            let mut batch_size = warp_config.initial_batch_size;
-            let results = stream::iter(samples)
-                .chunks(batch_size)
-                .map(|batch| {
-                    let batch_metrics = self
-                        .metrics_tracker
-                        .start_batch_execution(&group.id, batch.len());
-                    async move {
-                        let result = self
-                            .process_warp_batch(batch, &memory_manager, &warp_config)
-                            .await;
-                        self.metrics_tracker
-                            .complete_batch_execution(batch_metrics, &result);
-
-                        // Adjust batch size based on performance
-                        batch_size = self.optimize_batch_size(batch_size, &result);
-
-                        result
-                    }
-                })
-                .buffer_unordered(warp_config.concurrent_warps)
-                .collect::<Vec<_>>()
-                .await;
-
-            // Cleanup and aggregate
-            memory_manager.cleanup().await?;
-            self.aggregate_warp_results(results, group)
-        }
-
-        async fn process_hybrid(
-            &self,
-            group: &CoreGroup,
-            distribution: &SampleDistribution,
-        ) -> Result<GroupResult, ProcessingError> {
-            // Initial workload split based on core capabilities and current load
-            let (gpu_samples, cpu_samples) = self.split_samples_for_hybrid(group, distribution)?;
-
-            // Set up monitoring for both GPU and CPU execution
-            let gpu_monitor = self.setup_execution_monitor(group.id);
-            let cpu_monitor = self.setup_execution_monitor(group.id);
-
-            // Process with dynamic load balancing
-            let (gpu_result, cpu_result) = join!(
-                async {
-                    let result = self.process_gpu_samples(gpu_samples, group).await;
-                    if let Ok(ref r) = result {
-                        self.metrics_tracker.record_gpu_execution(r).await?;
-                    }
-                    result
+            let result = match mode {
+                ProcessingMode::Training { .. } => {
+                    self.process_training_assignment(assignment).await
                 },
-                async {
-                    let result = self.process_cpu_samples(cpu_samples, group).await;
-                    if let Ok(ref r) = result {
-                        self.metrics_tracker.record_cpu_execution(r).await?;
-                    }
-                    result
+                ProcessingMode::Inference { .. } => {
+                    self.process_inference_assignment(assignment).await
                 }
+            };
+
+            // Update metrics regardless of success/failure
+            self.metrics_tracker.complete_assignment(&assignment.id);
+
+            result
+        }
+        // Training assignment processing
+        async fn process_training_assignment(
+            &mut self,
+            assignment: WorkAssignment,
+        ) -> Result<WorkResult, ProcessingError> {
+            // Setup training context
+            let training_context = self.prepare_training_context(&assignment)?;
+
+            let result = match &self.processing_pattern {
+                ProcessingPattern::WarpBased { .. } => {
+                    self.process_warp_based_training(assignment, training_context).await
+                },
+                ProcessingPattern::ThreadBased { .. } => {
+                    self.process_thread_based_training(assignment, training_context).await
+                },
+                ProcessingPattern::Hybrid { .. } => {
+                    self.process_hybrid_training(assignment, training_context).await
+                }
+            };
+
+            // Monitor performance and adjust if needed
+            self.monitor_training_performance().await?;
+
+            result
+        }
+
+        // Context preparation methods
+        async fn prepare_training_context(
+            &self,
+            assignment: &WorkAssignment,
+        ) -> Result<TrainingContext, ProcessingError> {
+            // Setup shared memory
+            let shared_memory = self.shared_memory_manager
+                .allocate_training_memory(assignment.estimated_memory_requirements())?;
+
+            // Initialize gradient buffers
+            let gradient_buffer = self.initialize_gradient_buffers()?;
+
+            // Create training context
+            Ok(TrainingContext {
+                batch_size: assignment.batch_size,
+                shared_memory,
+                gradient_buffer,
+                optimizer_state: self.optimizer_state.clone(),
+                training_config: self.training_config.clone(),
+            })
+        }
+
+        async fn process_warp_based_training(
+            &mut self,
+            assignment: WorkAssignment,
+            context: TrainingContext,
+        ) -> Result<WorkResult, ProcessingError> {
+            let batches = self.create_training_batches(&assignment, &context)?;
+            let mut results = Vec::new();
+
+            for batch in batches {
+                // Setup warp configuration
+                let warp_config = self.create_warp_config(&self.processing_pattern)?;
+
+                // Process batch with warps
+                let batch_result = self.batch_coordinator
+                    .process_warp_training_batch(
+                        batch,
+                        &self.processing_units,
+                        &warp_config
+                    ).await?;
+
+                // Training-specific: Synchronize gradients
+                self.synchronize_warp_gradients(&batch_result).await?;
+
+                // Record metrics
+                self.metrics_tracker.record_warp_batch_completion(
+                    &batch_result,
+                    BatchMode::Training
+                ).await?;
+
+                results.push(batch_result);
+            }
+
+            Ok(self.aggregate_training_results(results)?)
+        }
+
+        // Thread-based Processing Implementations
+        async fn process_thread_based_training(
+            &mut self,
+            assignment: WorkAssignment,
+            context: TrainingContext,
+        ) -> Result<WorkResult, ProcessingError> {
+            let batches = self.create_training_batches(&assignment, &context)?;
+            let mut results = Vec::new();
+
+            for batch in batches {
+                // Setup thread pool configuration
+                let thread_config = self.create_thread_config(&self.processing_pattern)?;
+
+                // Process batch with thread pool
+                let batch_result = self.batch_coordinator
+                    .process_thread_training_batch(
+                        batch,
+                        &self.processing_units,
+                        &thread_config
+                    ).await?;
+
+                // Training-specific: Synchronize gradients
+                self.synchronize_thread_gradients(&batch_result).await?;
+
+                // Record metrics
+                self.metrics_tracker.record_thread_batch_completion(
+                    &batch_result,
+                    BatchMode::Training
+                ).await?;
+
+                results.push(batch_result);
+            }
+
+            Ok(self.aggregate_training_results(results)?)
+        }
+
+        // Hybrid Processing Implementations
+        async fn process_hybrid_training(
+            &mut self,
+            assignment: WorkAssignment,
+            context: TrainingContext,
+        ) -> Result<WorkResult, ProcessingError> {
+            // Split work based on core capabilities
+            let (gpu_work, cpu_work) = self.split_hybrid_work(&assignment)?;
+
+            // Process in parallel on GPU and CPU
+            let (gpu_result, cpu_result) = tokio::join!(
+                self.process_gpu_training_work(gpu_work, &context),
+                self.process_cpu_training_work(cpu_work, &context)
             );
 
-            // Analyze results and adjust split ratio for future executions
-            self.update_hybrid_split_ratio(group, &gpu_result?, &cpu_result?)
-                .await?;
+            // Synchronize results and gradients between GPU and CPU
+            self.synchronize_hybrid_training(gpu_result?, cpu_result?).await
+        }
 
-            // Merge results with error handling
-            let merged_result = self.merge_hybrid_results(gpu_result?, cpu_result?)?;
+        // Inference assignment processing
+        async fn process_inference_assignment(
+            &mut self,
+            assignment: WorkAssignment,
+        ) -> Result<WorkResult, ProcessingError> {
+            // Setup inference context
+            let inference_context = self.prepare_inference_context(&assignment)?;
 
-            // Update efficiency metrics
-            self.metrics_tracker
-                .record_hybrid_efficiency(group.id, &merged_result)
-                .await?;
+            let result = match &self.processing_pattern {
+                ProcessingPattern::WarpBased { .. } => {
+                    self.process_warp_based_inference(assignment, inference_context).await
+                },
+                ProcessingPattern::ThreadBased { .. } => {
+                    self.process_thread_based_inference(assignment, inference_context).await
+                },
+                ProcessingPattern::Hybrid { .. } => {
+                    self.process_hybrid_inference(assignment, inference_context).await
+                }
+            };
 
-            Ok(merged_result)
+            // Monitor performance and adjust if needed
+            self.monitor_inference_performance().await?;
+
+            result
+        }
+
+        async fn prepare_inference_context(
+            &self,
+            assignment: &WorkAssignment,
+        ) -> Result<InferenceContext, ProcessingError> {
+            // Setup shared memory
+            let shared_memory = self.shared_memory_manager
+                .allocate_inference_memory(assignment.estimated_memory_requirements())?;
+
+            // Initialize KV cache
+            let kv_cache = self.initialize_kv_cache(assignment.sequence_length)?;
+
+            // Create inference context
+            Ok(InferenceContext {
+                sequence_length: assignment.sequence_length,
+                shared_memory,
+                kv_cache,
+                inference_config: self.inference_config.clone(),
+            })
+        }
+
+        async fn process_warp_based_inference(
+            &mut self,
+            assignment: WorkAssignment,
+            context: InferenceContext,
+        ) -> Result<WorkResult, ProcessingError> {
+            let batches = self.create_inference_batches(&assignment, &context)?;
+            let mut results = Vec::new();
+
+            for batch in batches {
+                // Setup warp configuration for inference
+                let warp_config = self.create_inference_warp_config(&self.processing_pattern)?;
+
+                // Process with KV cache management
+                let batch_result = self.batch_coordinator
+                    .process_warp_inference_batch(
+                        batch,
+                        &self.processing_units,
+                        &warp_config,
+                        &mut context.kv_cache,
+                    ).await?;
+
+                // Record metrics
+                self.metrics_tracker.record_warp_batch_completion(
+                    &batch_result,
+                    BatchMode::Inference
+                ).await?;
+
+                results.push(batch_result);
+            }
+
+            Ok(self.aggregate_inference_results(results)?)
+        }
+
+        async fn process_thread_based_inference(
+            &mut self,
+            assignment: WorkAssignment,
+            context: InferenceContext,
+        ) -> Result<WorkResult, ProcessingError> {
+            let batches = self.create_inference_batches(&assignment, &context)?;
+            let mut results = Vec::new();
+
+            for batch in batches {
+                // Setup thread pool configuration for inference
+                let thread_config = self.create_inference_thread_config(&self.processing_pattern)?;
+
+                // Process with cache-aware scheduling
+                let batch_result = self.batch_coordinator
+                    .process_thread_inference_batch(
+                        batch,
+                        &self.processing_units,
+                        &thread_config,
+                        &mut context.kv_cache,
+                    ).await?;
+
+                // Record metrics
+                self.metrics_tracker.record_thread_batch_completion(
+                    &batch_result,
+                    BatchMode::Inference
+                ).await?;
+
+                results.push(batch_result);
+            }
+
+            Ok(self.aggregate_inference_results(results)?)
+        }
+
+        async fn process_hybrid_inference(
+            &mut self,
+            assignment: WorkAssignment,
+            context: InferenceContext,
+        ) -> Result<WorkResult, ProcessingError> {
+            // Split sequence processing between GPU and CPU
+            let (gpu_work, cpu_work) = self.split_hybrid_sequence_work(&assignment)?;
+
+            // Process in parallel with shared KV cache
+            let (gpu_result, cpu_result) = tokio::join!(
+                self.process_gpu_inference_work(gpu_work, &context),
+                self.process_cpu_inference_work(cpu_work, &context)
+            );
+
+            // Merge results maintaining sequence order
+            self.merge_hybrid_inference_results(gpu_result?, cpu_result?).await
+        }
+
+        // Sample distribution methods
+        pub async fn distribute_samples(
+            &mut self,
+            mode: ProcessingMode,
+            samples: Vec<Sample>
+        ) -> Result<(), ProcessingError> {
+            // Initialize work queue
+            self.work_queue.add_samples(samples);
+
+            // Create batch assignments based on mode
+            match mode {
+                ProcessingMode::Training { batch_size, .. } => {
+                    self.create_training_batch_assignments(batch_size).await?
+                },
+                ProcessingMode::Inference { sequence_length, .. } => {
+                    self.create_inference_batch_assignments(sequence_length).await?
+                }
+            };
+
+            // Start processing
+            self.start_batch_processing(mode).await?;
+
+            Ok(())
+        }
+
+        async fn create_training_batch_assignments(
+            &mut self,
+            batch_size: usize,
+        ) -> Result<(), ProcessingError> {
+            let units_per_batch = batch_size / self.processing_units.len();
+
+            for batch_idx in 0..(self.work_queue.total_samples() / batch_size) {
+                // Get units for this batch
+                let batch_units: Vec<_> = self.processing_units
+                    .iter_mut()
+                    .skip(batch_idx * units_per_batch)
+                    .take(units_per_batch)
+                    .collect();
+
+                // Setup shared memory for batch
+                let shared_memory = self.shared_memory_manager
+                    .allocate_batch_memory(batch_units.iter().map(|u| u.id).collect())?;
+
+                // Create batch state
+                let batch_id = BatchId::new();
+                let batch_state = BatchState::new_training(
+                    batch_units.iter().map(|u| u.id).collect(),
+                    shared_memory,
+                );
+
+                self.batch_coordinator.current_batches.insert(batch_id, batch_state);
+            }
+
+            Ok(())
+        }
+
+        async fn create_inference_batch_assignments(
+            &mut self,
+            sequence_length: usize,
+        ) -> Result<(), ProcessingError> {
+            let sequences_per_unit = self.work_queue.total_sequences() / self.processing_units.len();
+
+            for batch_idx in 0..sequences_per_unit {
+                // Get units for this batch
+                let batch_units: Vec<_> = self.processing_units
+                    .iter_mut()
+                    .take(self.processing_units.len())
+                    .collect();
+
+                // Setup shared memory and KV cache for batch
+                let shared_memory = self.shared_memory_manager
+                    .allocate_inference_memory(
+                        batch_units.iter().map(|u| u.id).collect(),
+                        sequence_length,
+                    )?;
+
+                // Create batch state
+                let batch_id = BatchId::new();
+                let batch_state = BatchState::new_inference(
+                    batch_units.iter().map(|u| u.id).collect(),
+                    shared_memory,
+                    sequence_length,
+                );
+
+                self.batch_coordinator.current_batches.insert(batch_id, batch_state);
+            }
+
+            Ok(())
+        }
+
+        async fn handle_unit_completion(
+            &mut self,
+            unit_id: CoreId,
+            batch_id: BatchId,
+            result: ProcessingResult,
+        ) -> Result<(), ProcessingError> {
+            // Update batch state
+            if let Some(batch_state) = self.batch_coordinator.current_batches.get_mut(&batch_id) {
+                batch_state.mark_unit_complete(unit_id, result)?;
+
+                // If batch is complete, process results and assign new work
+                if batch_state.is_complete() {
+                    self.handle_batch_results(batch_id).await?;
+                }
+            }
+
+            Ok(())
+        }
+
+        async fn handle_batch_results(
+            &mut self,
+            results: Vec<Result<BatchResult, ProcessingError>>,
+        ) -> Result<Vec<BatchResult>, ProcessingError> {
+            let (successful, failed): (Vec<_>, Vec<_>) = results
+                .into_iter()
+                .partition(Result::is_ok);
+
+            if !failed.is_empty() {
+                self.handle_unit_failures(&failed).await?;
+            }
+
+            Ok(successful.into_iter().map(Result::unwrap).collect())
         }
 
         // Helper methods for processing
@@ -919,149 +1306,26 @@ mod core {
             )
         }
 
-        fn optimize_batch_size(&self, current_size: usize, result: &BatchResult) -> usize {
-            let efficiency = result.processing_efficiency();
-            let error_rate = result.error_rate();
+        async fn handle_stragglers(
+            &mut self,
+            batch: &Batch,
+            stragglers: Vec<ProcessingUnitId>,
+        ) -> Result<(), ProcessingError> {
+            // Find fastest available units
+            let replacement_units = self.find_replacement_units(stragglers.len())?;
 
-            match (efficiency, error_rate) {
-                (e, err) if e > 0.9 && err < 0.01 => current_size * 2,
-                (e, err) if e < 0.6 || err > 0.05 => current_size / 2,
-                _ => current_size,
+            // Redistribute straggler work
+            for (straggler_id, replacement_unit) in stragglers.iter().zip(replacement_units) {
+                let work = self.get_remaining_work(*straggler_id)?;
+                replacement_unit.take_over_work(work).await?;
             }
-            .clamp(self.config.min_batch_size, self.config.max_batch_size)
+
+            // Mark stragglers for evaluation
+            self.evaluate_units(stragglers).await?;
+
+            Ok(())
         }
 
-        async fn execute_standard_work(
-            &self,
-            work_unit: WorkUnit,
-            memory_manager: &MemoryManager,
-            config: &ProcessingConfig,
-        ) -> Result<WorkResult, ProcessingError> {
-            match &self.processing_pattern {
-                ProcessingPattern::WarpBased {
-                    warp_size,
-                    warps_per_block,
-                    credit_cost_per_warp,
-                    memory_strategy,
-                } => {
-                    // Initialize CUDA execution
-                    let cuda_context = self.init_cuda_context(memory_strategy)?;
-
-                    // Organize work into warps
-                    let warp_blocks =
-                        self.create_warp_blocks(work_unit, *warp_size, *warps_per_block)?;
-
-                    // Execute with shared memory optimization
-                    let mut results = Vec::new();
-                    for block in warp_blocks {
-                        let block_result = self
-                            .execute_warp_block(block, &cuda_context, memory_manager, memory_strategy)
-                            .await?;
-
-                        results.push(block_result);
-                    }
-
-                    // Calculate costs and aggregate
-                    let cost = self.calculate_warp_execution_cost(results.len(), *credit_cost_per_warp);
-
-                    Ok(WorkResult {
-                        data: self.aggregate_warp_results(results)?,
-                        metrics: self.collect_execution_metrics(),
-                        cost,
-                    })
-                }
-                ProcessingPattern::ThreadBased {
-                    thread_count,
-                    vector_width,
-                    credit_cost_per_thread,
-                    cache_strategy,
-                } => {
-                    // Set up thread pool with SIMD awareness
-                    let thread_pool =
-                        self.create_thread_pool(*thread_count, *vector_width, cache_strategy)?;
-
-                    // Partition work for cache efficiency
-                    let work_partitions =
-                        self.create_cache_aware_partitions(work_unit, cache_strategy)?;
-
-                    // Execute with thread affinity
-                    let results = thread_pool.execute_partitions(work_partitions).await?;
-
-                    // Calculate costs and aggregate
-                    let cost =
-                        self.calculate_thread_execution_cost(results.len(), *credit_cost_per_thread);
-
-                    Ok(WorkResult {
-                        data: self.aggregate_thread_results(results)?,
-                        metrics: self.collect_execution_metrics(),
-                        cost,
-                    })
-                }
-                _ => Err(ProcessingError::InvalidPattern),
-            }
-        }
-
-        // Helper methods for CUDA execution
-        async fn execute_warp_block(
-            &self,
-            block: WarpBlock,
-            cuda_context: &CudaContext,
-            memory_manager: &MemoryManager,
-            strategy: &MemoryStrategy,
-        ) -> Result<BlockResult, ProcessingError> {
-            // Load data into shared memory
-            let shared_mem =
-                memory_manager.allocate_shared(block.size(), strategy.shared_memory_usage)?;
-
-            // Configure memory access patterns
-            cuda_context.set_memory_access_pattern(&strategy.coalescing_strategy)?;
-
-            // Execute warps in parallel
-            let result = cuda_context.execute_warps(block, shared_mem).await?;
-
-            // Collect metrics and cleanup
-            memory_manager.deallocate_shared(shared_mem)?;
-
-            Ok(result)
-        }
-
-        // Helper methods for CPU execution
-        async fn execute_cpu_work(
-            &self,
-            work: WorkUnit,
-            cpu_cores: &[CoreId],
-            memory_manager: &MemoryManager,
-        ) -> Result<WorkResult, ProcessingError> {
-            // Set up SIMD operations
-            let simd_context = self.init_simd_context()?;
-
-            // Create cache-friendly memory layout
-            let memory_layout = memory_manager.create_cache_aligned_layout(
-                work.data_size(),
-                self.cache_strategy.cache_levels.clone(),
-            )?;
-
-            // Execute with thread affinity
-            let thread_results = self
-                .thread_pool
-                .scoped(|scope| {
-                    cpu_cores
-                        .iter()
-                        .map(|core| {
-                            scope.spawn(async move {
-                                self.process_cpu_partition(
-                                    work.partition_for_core(*core),
-                                    &simd_context,
-                                    &memory_layout,
-                                )
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .await?;
-
-            Ok(self.aggregate_cpu_results(thread_results)?)
-        }
     }
 
     impl ProcessingUnit {
@@ -1090,104 +1354,641 @@ mod core {
             }
         }
 
-        pub async fn assign_work(
+        pub async fn process_work(
             &mut self,
-            assignment: WorkAssignment
-        ) -> Result<(), ProcessingError> {
-            if self.current_assignment.is_some() {
-                return Err(ProcessingError::ResourceAllocation(
-                    "Core already has assigned work".into()
-                ));
+            mode: ProcessingMode,
+            work: &[Sample],
+            memory_manager: &MemoryManager,
+        ) -> Result<ProcessingResult, ProcessingError> {
+            match mode {
+                ProcessingMode::Training { .. } => {
+                    self.start_training_batch_processing(work, memory_manager).await
+                },
+                ProcessingMode::Inference { .. } => {
+                    self.start_inference_batch_processing(work, memory_manager).await
+                }
             }
+        }
 
-            self.validate_assignment_requirements(&assignment)?;
-            self.current_assignment = Some(assignment);
-            self.current_load = 0.0;
+        async fn start_training_batch_processing(
+            &mut self,
+            context: BatchContext,
+        ) -> Result<(), ProcessingError> {
+            // Setup shared memory access
+            self.shared_memory_access = Some(
+                SharedMemoryAccess::new(context.shared_memory.clone())?
+            );
+
+            // Store batch context
+            self.batch_context = Some(context);
+
+            // Start processing
+            self.process_training_batch().await?;
+
             Ok(())
         }
 
-        pub async fn process_samples(
+        pub async fn process_training_batch(
             &mut self,
-            samples: &[Sample],
-            memory_manager: &MemoryManager,
-        ) -> Result<ProcessingResult, ProcessingError> {
+            batch_context: BatchContext,
+        ) -> Result<BatchResult, ProcessingError> {
+            self.current_batch = Some(batch_context.clone());
+
+            // Setup compute context for batch
+            self.compute_context.prepare_for_batch(&batch_context)?;
+
+            match batch_context.current_phase {
+                BatchPhase::Forward => {
+                    self.forward_pass(batch_context.inputs).await
+                },
+                BatchPhase::Backward => {
+                    self.backward_pass(batch_context.grad_output.unwrap()).await
+                },
+                BatchPhase::GradientSync => {
+                    self.sync_gradients().await
+                },
+                BatchPhase::ParameterUpdate => {
+                    self.update_parameters().await
+                },
+            }
+        }
+
+        async fn forward_pass(&mut self, input: Tensor) -> Result<BatchResult, ProcessingError> {
+            // Get current model parameters
+            let parameters = self.shared_state.model_parameters.read().await;
+
             match &self.core_type {
                 CoreType::CUDA { .. } => {
-                    self.process_gpu_samples(samples, memory_manager).await
+                    self.execute_cuda_forward(input, &parameters).await
                 },
                 CoreType::CPU { .. } => {
-                    self.process_cpu_samples(samples, memory_manager).await
+                    self.execute_cpu_forward(input, &parameters).await
                 }
             }
         }
 
-        async fn process_gpu_samples(
-            &self,
-            samples: &[Sample],
-            memory_manager: &MemoryManager,
-        ) -> Result<ProcessingResult, ProcessingError> {
-            let cuda_context = self.init_cuda_context()?;
-            let batch_size = self.calculate_optimal_batch_size(samples.len())?;
+        // CUDA-specific implementations
+        async fn execute_cuda_forward(
+            &mut self,
+            input: Tensor,
+            parameters: &ModelParameters,
+        ) -> Result<BatchResult, ProcessingError> {
+            let cuda_stream = self.compute_context.current_stream.as_ref().unwrap();
 
-            let results = stream::iter(samples.chunks(batch_size))
-                .map(|batch| {
-                    let context = cuda_context.clone();
-                    async move {
-                        self.process_gpu_batch(batch, &context, memory_manager).await
-                    }
-                })
-                .buffer_unordered(self.capabilities.max_concurrent_batches)
-                .collect::<Vec<_>>()
-                .await;
+            // Transfer input to GPU memory
+            let gpu_input = self.tensor_memory.transfer_to_device(&input)?;
 
-            self.aggregate_results(results)
+            // Execute forward kernels
+            for layer in &parameters.layers {
+                let layer_output = cuda_stream.execute_forward_kernel(
+                    &gpu_input,
+                    layer,
+                    &self.compute_context.kernel_cache,
+                )?;
+
+                gpu_input = layer_output;
+            }
+
+            // Transfer result back if needed
+            let output = self.tensor_memory.transfer_from_device(&gpu_input)?;
+
+            Ok(BatchResult {
+                output,
+                metrics: self.collect_execution_metrics(),
+            })
         }
 
-        async fn process_cpu_samples(
-            &self,
-            samples: &[Sample],
-            memory_manager: &MemoryManager,
-        ) -> Result<ProcessingResult, ProcessingError> {
+        // CPU-specific implementations
+        async fn execute_cpu_forward(
+            &mut self,
+            input: Tensor,
+            parameters: &ModelParameters,
+        ) -> Result<BatchResult, ProcessingError> {
             let simd_context = self.init_simd_context()?;
-            let cache_strategy = self.create_cache_strategy()?;
 
-            let partitions = self.create_cache_aware_partitions(
-                samples,
-                &cache_strategy
+            let mut current_input = input;
+
+            // Process through layers
+            for layer in &parameters.layers {
+                current_input = simd_context.execute_layer_forward(
+                    &current_input,
+                    layer,
+                    &self.compute_context.kernel_cache,
+                )?;
+            }
+
+            Ok(BatchResult {
+                output: current_input,
+                metrics: self.collect_execution_metrics(),
+            })
+        }
+
+        async fn backward_pass(&mut self, grad_output: Tensor) -> Result<BatchResult, ProcessingError> {
+            match &self.core_type {
+                CoreType::CUDA { .. } => {
+                    self.execute_cuda_backward(grad_output).await
+                },
+                CoreType::CPU { .. } => {
+                    self.execute_cpu_backward(grad_output).await
+                }
+            }
+        }
+
+        // Backward pass implementations
+        async fn execute_cuda_backward(
+            &mut self,
+            grad_output: Tensor,
+        ) -> Result<BatchResult, ProcessingError> {
+            let cuda_stream = self.compute_context.current_stream.as_ref().unwrap();
+
+            // Transfer gradient to GPU
+            let gpu_grad = self.tensor_memory.transfer_to_device(&grad_output)?;
+
+            // Get activation cache from forward pass
+            let activation_cache = self.get_activation_cache()?;
+
+            // Execute backward kernels in reverse layer order
+            let mut current_grad = gpu_grad;
+            for layer in self.model_parameters.layers.iter().rev() {
+                let layer_cache = activation_cache.get_layer_cache(layer.id)?;
+
+                // Layer-specific backward computation
+                current_grad = cuda_stream.execute_backward_kernel(
+                    &current_grad,
+                    layer,
+                    layer_cache,
+                    &self.compute_context.kernel_cache,
+                )?;
+
+                // Accumulate gradients for layer parameters
+                cuda_stream.accumulate_parameter_gradients(
+                    layer,
+                    &current_grad,
+                    layer_cache,
+                )?;
+            }
+
+            Ok(BatchResult {
+                output: self.tensor_memory.transfer_from_device(&current_grad)?,
+                metrics: self.collect_execution_metrics(),
+            })
+        }
+
+        async fn execute_cpu_backward(
+            &mut self,
+            grad_output: Tensor,
+        ) -> Result<BatchResult, ProcessingError> {
+            let simd_context = self.init_simd_context()?;
+
+            // Get activation cache from forward pass
+            let activation_cache = self.get_activation_cache()?;
+
+            // Execute backward pass with SIMD optimizations
+            let mut current_grad = grad_output;
+            for layer in self.model_parameters.layers.iter().rev() {
+                let layer_cache = activation_cache.get_layer_cache(layer.id)?;
+
+                // Layer-specific backward computation
+                current_grad = simd_context.execute_layer_backward(
+                    &current_grad,
+                    layer,
+                    layer_cache,
+                    &self.compute_context.kernel_cache,
+                )?;
+
+                // Accumulate gradients for layer parameters
+                simd_context.accumulate_parameter_gradients(
+                    layer,
+                    &current_grad,
+                    layer_cache,
+                )?;
+            }
+
+            Ok(BatchResult {
+                output: current_grad,
+                metrics: self.collect_execution_metrics(),
+            })
+        }
+
+        async fn sync_gradients(&mut self) -> Result<(), ProcessingError> {
+            let local_gradients = self.collect_local_gradients().await?;
+
+            // Synchronize with group
+            self.gradient_synchronizer
+                .sync_unit_gradients(self.id, local_gradients)
+                .await
+        }
+
+        async fn update_parameters(&mut self) -> Result<(), ProcessingError> {
+            let optimizer = self.shared_state.optimizer.read().await;
+            let parameters = self.shared_state.model_parameters.write().await;
+            let gradients = self.shared_state.gradients.read().await;
+
+            optimizer.step(&mut parameters, &gradients)
+        }
+
+        async fn start_inference_batch_processing(
+            &mut self,
+            context: BatchContext,
+        ) -> Result<(), ProcessingError> {
+            // Setup shared memory access
+            self.shared_memory_access = Some(
+                SharedMemoryAccess::new(context.shared_memory.clone())?
+            );
+
+            // Store batch context
+            self.batch_context = Some(context);
+
+            // Start processing
+            self.process_inference_batch().await?;
+
+            Ok(())
+        }
+
+        async fn process_inference_batch(
+            &mut self,
+            batch_context: BatchContext,
+        ) -> Result<BatchResult, ProcessingError> {
+            self.current_batch = Some(batch_context.clone());
+
+            // Setup compute context for batch
+            self.compute_context.prepare_for_batch(&batch_context)?;
+
+            match batch_context.current_phase {
+                InferencePhase::Preprocessing => {
+                    self.preprocessing_pass(batch_context.inputs).await
+                },
+                InferencePhase::Attention { layer_idx, is_cross_attention } => {
+                    self.attention_pass(
+                        batch_context.inputs,
+                        layer_idx,
+                        is_cross_attention
+                    ).await
+                },
+                InferencePhase::FeedForward { layer_idx } => {
+                    self.feedforward_pass(
+                        batch_context.inputs,
+                        layer_idx
+                    ).await
+                },
+                InferencePhase::Generation { sequence_length, max_new_tokens } => {
+                    self.generation_pass(
+                        batch_context.inputs,
+                        sequence_length,
+                        max_new_tokens
+                    ).await
+                }
+            }
+        }
+
+        async fn preprocessing_pass(
+            &mut self,
+            input: Tensor,
+        ) -> Result<BatchResult, ProcessingError> {
+            match &self.core_type {
+                CoreType::CUDA { .. } => {
+                    self.execute_cuda_preprocessing(input).await
+                },
+                CoreType::CPU { .. } => {
+                    self.execute_cpu_preprocessing(input).await
+                }
+            }
+        }
+
+        async fn execute_cuda_preprocessing(
+            &mut self,
+            input: Tensor,
+        ) -> Result<BatchResult, ProcessingError> {
+            let cuda_stream = self.compute_context.current_stream.as_ref().unwrap();
+
+            // Transfer input to GPU
+            let gpu_input = self.tensor_memory.transfer_to_device(&input)?;
+
+            // Token embedding and position encoding
+            let embedded = cuda_stream.execute_embedding_kernel(&gpu_input)?;
+
+            Ok(BatchResult {
+                output: self.tensor_memory.transfer_from_device(&embedded)?,
+                metrics: self.collect_execution_metrics(),
+            })
+        }
+
+        async fn execute_cpu_preprocessing(
+            &mut self,
+            input: Tensor,
+        ) -> Result<BatchResult, ProcessingError> {
+            let simd_context = self.init_simd_context()?;
+
+            // Token embedding with SIMD optimization
+            let embedded = simd_context.execute_embedding(
+                &input,
+                &self.model_parameters.embedding_table,
             )?;
 
-            let results = self.thread_pool
-                .scoped(|scope| {
-                    partitions.into_iter()
-                        .map(|partition| {
-                            scope.spawn(async move {
-                                self.process_cpu_partition(
-                                    partition,
-                                    &simd_context,
-                                    memory_manager
-                                ).await
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .await?;
+            // Position encoding
+            let position_encoded = simd_context.add_position_encoding(
+                &embedded,
+                embedded.shape[1], // sequence length
+                &self.model_parameters.position_encodings,
+            )?;
 
-            self.aggregate_results(results)
+            Ok(BatchResult {
+                output: position_encoded,
+                metrics: self.collect_execution_metrics(),
+            })
         }
 
-        fn calculate_optimal_batch_size(&self, total_samples: usize) -> Result<usize, ProcessingError> {
+
+        async fn attention_pass(
+            &mut self,
+            input: Tensor,
+            layer_idx: usize,
+            is_cross_attention: bool,
+        ) -> Result<BatchResult, ProcessingError> {
             match &self.core_type {
-                CoreType::CUDA { warp_size, .. } => {
-                    let base_size = warp_size * 32; // Standard CUDA warp size
-                    Ok((base_size..=base_size * 4)
-                        .find(|&size| size >= total_samples)
-                        .unwrap_or(base_size))
+                CoreType::CUDA { .. } => {
+                    self.execute_cuda_attention(
+                        input,
+                        layer_idx,
+                        is_cross_attention
+                    ).await
                 },
-                CoreType::CPU { simd_width, cache_size, .. } => {
-                    let width = simd_width.unwrap_or(1);
-                    let cache_optimal = cache_size / std::mem::size_of::<Sample>();
-                    Ok(width * (cache_optimal.min(total_samples)))
+                CoreType::CPU { .. } => {
+                    self.execute_cpu_attention(
+                        input,
+                        layer_idx,
+                        is_cross_attention
+                    ).await
                 }
+            }
+        }
+
+        async fn execute_cuda_attention(
+            &mut self,
+            input: Tensor,
+            layer_idx: usize,
+            is_cross_attention: bool,
+        ) -> Result<BatchResult, ProcessingError> {
+            let cuda_stream = self.compute_context.current_stream.as_ref().unwrap();
+            let gpu_input = self.tensor_memory.transfer_to_device(&input)?;
+
+            // KV Cache management
+            let cache = self.get_or_create_kv_cache(layer_idx)?;
+
+            // Execute attention
+            let output = if is_cross_attention {
+                cuda_stream.execute_cross_attention_kernel(
+                    &gpu_input,
+                    cache,
+                    &self.compute_context.kernel_cache,
+                )?
+            } else {
+                cuda_stream.execute_self_attention_kernel(
+                    &gpu_input,
+                    cache,
+                    &self.compute_context.kernel_cache,
+                )?
+            };
+
+            Ok(BatchResult {
+                output: self.tensor_memory.transfer_from_device(&output)?,
+                metrics: self.collect_execution_metrics(),
+            })
+        }
+
+        // CPU implementations
+        async fn execute_cpu_attention(
+            &mut self,
+            input: Tensor,
+            layer_idx: usize,
+            is_cross_attention: bool,
+        ) -> Result<BatchResult, ProcessingError> {
+            let simd_context = self.init_simd_context()?;
+
+            // KV Cache management
+            let cache = self.get_or_create_kv_cache(layer_idx)?;
+
+            // Execute attention with SIMD optimizations
+            let output = if is_cross_attention {
+                simd_context.execute_cross_attention(
+                    &input,
+                    cache,
+                    &self.compute_context.kernel_cache,
+                )?
+            } else {
+                simd_context.execute_self_attention(
+                    &input,
+                    cache,
+                    &self.compute_context.kernel_cache,
+                )?
+            };
+
+            Ok(BatchResult {
+                output,
+                metrics: self.collect_execution_metrics(),
+            })
+        }
+
+        async fn feedforward_pass(
+            &mut self,
+            input: Tensor,
+            layer_idx: usize,
+        ) -> Result<BatchResult, ProcessingError> {
+            match &self.core_type {
+                CoreType::CUDA { .. } => {
+                    self.execute_cuda_feedforward(input, layer_idx).await
+                },
+                CoreType::CPU { .. } => {
+                    self.execute_cpu_feedforward(input, layer_idx).await
+                }
+            }
+        }
+
+        // Feedforward implementations
+        async fn execute_cuda_feedforward(
+            &mut self,
+            input: Tensor,
+            layer_idx: usize,
+        ) -> Result<BatchResult, ProcessingError> {
+            let cuda_stream = self.compute_context.current_stream.as_ref().unwrap();
+            let gpu_input = self.tensor_memory.transfer_to_device(&input)?;
+
+            // Get layer parameters
+            let layer = &self.model_parameters.layers[layer_idx];
+
+            // First linear transformation
+            let intermediate = cuda_stream.execute_linear_kernel(
+                &gpu_input,
+                &layer.intermediate_weight,
+                &layer.intermediate_bias,
+            )?;
+
+            // Activation function
+            let activated = cuda_stream.execute_activation_kernel(
+                &intermediate,
+                layer.activation_type,
+            )?;
+
+            // Second linear transformation
+            let output = cuda_stream.execute_linear_kernel(
+                &activated,
+                &layer.output_weight,
+                &layer.output_bias,
+            )?;
+
+            Ok(BatchResult {
+                output: self.tensor_memory.transfer_from_device(&output)?,
+                metrics: self.collect_execution_metrics(),
+            })
+        }
+
+        async fn execute_cpu_feedforward(
+            &mut self,
+            input: Tensor,
+            layer_idx: usize,
+        ) -> Result<BatchResult, ProcessingError> {
+            let simd_context = self.init_simd_context()?;
+
+            // Get layer parameters
+            let layer = &self.model_parameters.layers[layer_idx];
+
+            // First linear transformation with SIMD
+            let intermediate = simd_context.execute_linear_transform(
+                &input,
+                &layer.intermediate_weight,
+                &layer.intermediate_bias,
+            )?;
+
+            // Activation function
+            let activated = simd_context.apply_activation(
+                &intermediate,
+                layer.activation_type,
+            )?;
+
+            // Second linear transformation
+            let output = simd_context.execute_linear_transform(
+                &activated,
+                &layer.output_weight,
+                &layer.output_bias,
+            )?;
+
+            Ok(BatchResult {
+                output,
+                metrics: self.collect_execution_metrics(),
+            })
+        }
+
+        async fn generation_pass(
+            &mut self,
+            input: Tensor,
+            sequence_length: usize,
+            max_new_tokens: usize,
+        ) -> Result<BatchResult, ProcessingError> {
+            match &self.core_type {
+                CoreType::CUDA { .. } => {
+                    self.execute_cuda_generation(
+                        input,
+                        sequence_length,
+                        max_new_tokens
+                    ).await
+                },
+                CoreType::CPU { .. } => {
+                    self.execute_cpu_generation(
+                        input,
+                        sequence_length,
+                        max_new_tokens
+                    ).await
+                }
+            }
+        }
+
+        // Generation implementations
+        async fn execute_cuda_generation(
+            &mut self,
+            input: Tensor,
+            sequence_length: usize,
+            max_new_tokens: usize,
+        ) -> Result<BatchResult, ProcessingError> {
+            let cuda_stream = self.compute_context.current_stream.as_ref().unwrap();
+            let mut gpu_input = self.tensor_memory.transfer_to_device(&input)?;
+
+            let mut generated_tokens = Vec::new();
+
+            for _ in 0..max_new_tokens {
+                // Get logits for next token
+                let logits = cuda_stream.execute_language_model_forward(
+                    &gpu_input,
+                    sequence_length + generated_tokens.len(),
+                )?;
+
+                // Sample next token
+                let next_token = cuda_stream.execute_sampling_kernel(
+                    &logits,
+                    &self.sampling_config,
+                )?;
+
+                generated_tokens.push(next_token);
+
+                // Update input for next iteration
+                gpu_input = cuda_stream.append_token(
+                    &gpu_input,
+                    next_token,
+                )?;
+            }
+
+            Ok(BatchResult {
+                output: self.tensor_memory.transfer_from_device(&gpu_input)?,
+                metrics: self.collect_generation_metrics(generated_tokens),
+            })
+        }
+
+        async fn execute_cpu_generation(
+            &mut self,
+            input: Tensor,
+            sequence_length: usize,
+            max_new_tokens: usize,
+        ) -> Result<BatchResult, ProcessingError> {
+            let simd_context = self.init_simd_context()?;
+            let mut current_input = input;
+
+            let mut generated_tokens = Vec::new();
+
+            for _ in 0..max_new_tokens {
+                // Get logits for next token with SIMD optimization
+                let logits = simd_context.execute_language_model_forward(
+                    &current_input,
+                    sequence_length + generated_tokens.len(),
+                )?;
+
+                // Sample next token
+                let next_token = simd_context.sample_next_token(
+                    &logits,
+                    &self.sampling_config,
+                )?;
+
+                generated_tokens.push(next_token);
+
+                // Update input for next iteration
+                current_input = simd_context.append_token(
+                    &current_input,
+                    next_token,
+                )?;
+            }
+
+            Ok(BatchResult {
+                output: current_input,
+                metrics: self.collect_generation_metrics(generated_tokens),
+            })
+        }
+
+        // Helper methods for generation
+        fn collect_generation_metrics(&self, generated_tokens: Vec<usize>) -> BatchMetrics {
+            BatchMetrics {
+                tokens_generated: generated_tokens.len(),
+                generation_time: self.measure_generation_time(),
+                memory_usage: self.measure_memory_usage(),
+                cache_stats: self.collect_cache_stats(),
+                token_throughput: self.calculate_token_throughput(generated_tokens.len()),
             }
         }
 
@@ -1230,34 +2031,30 @@ mod core {
 
         pub async fn create_group_for_job(
             &mut self,
-            job_requirements: &JobRequirements,
-            available_cores: &[ProcessingUnit],
-        ) -> Result<CoreGroup, ProcessingError> {
-            // Score and select cores based on requirements
-            let scored_cores = self.score_cores_for_job(available_cores, job_requirements).await?;
-
-            // Determine optimal group composition
-            let (selected_cores, pattern) = self.determine_group_composition(
-                scored_cores,
-                job_requirements
+            requirements: &JobRequirements,
+            hints: &OptimizationHints,
+        ) -> Result<GroupId, ProcessingError> {
+            let scored_cores = self.score_cores_for_job(
+                &self.available_cores,
+                requirements
             ).await?;
 
-            // Create the group
-            let group_id = GroupId(Uuid::new_v4());
-            let worker_id = selected_cores[0].worker_id; // All cores should be from same worker
+            let (selected_cores, pattern) = self.determine_group_composition(
+                scored_cores,
+                requirements
+            ).await?;
 
             let group = CoreGroup::new(
-                group_id,
+                GroupId(Uuid::new_v4()),
                 selected_cores.iter().map(|c| c.id).collect(),
-                worker_id,
                 pattern,
                 self.calculate_group_locality(&selected_cores)?,
             );
 
             // Register group
-            self.groups.insert(group_id, group.clone());
+            self.groups.insert(group.id, group.clone());
 
-            Ok(group)
+            Ok(group.id)
         }
 
         async fn score_cores_for_job(
@@ -1507,6 +2304,1449 @@ mod core {
     }
 }
 
+mod memory {
+    pub struct DistributedMemoryManager {
+        memory_segments: HashMap<SegmentId, MemorySegment>,
+        segment_distribution: HashMap<WorkerId, Vec<SegmentId>>,
+        cache_manager: CacheManager,
+    }
+
+    pub struct MemorySegment {
+        id: SegmentId,
+        data: Arc<RwLock<Vec<u8>>>,
+        access_pattern: AccessPattern,
+        replicas: HashMap<WorkerId, SegmentReplica>,
+    }
+
+    impl DistributedMemoryManager {
+        async fn allocate_shared_segment(
+            &mut self,
+            size: usize,
+            access_pattern: AccessPattern,
+        ) -> Result<SegmentId, ProcessingError> {
+            // Create new segment
+            let segment = MemorySegment::new(size, access_pattern);
+
+            // Determine optimal distribution
+            let distribution = self.calculate_segment_distribution(
+                &segment,
+                &self.processing_units,
+            )?;
+
+            // Distribute segment
+            for (worker_id, replica_config) in distribution {
+                self.create_segment_replica(
+                    segment.id,
+                    worker_id,
+                    replica_config,
+                ).await?;
+            }
+
+            self.memory_segments.insert(segment.id, segment);
+            Ok(segment.id)
+        }
+
+        async fn maintain_coherency(&mut self) -> Result<(), ProcessingError> {
+            // Monitor segment access patterns
+            for segment in self.memory_segments.values_mut() {
+                if segment.needs_synchronization() {
+                    self.synchronize_segment(segment.id).await?;
+                }
+            }
+
+            // Update replica distribution if needed
+            self.optimize_distribution().await?;
+
+            Ok(())
+        }
+
+        async fn synchronize_segment(&mut self, segment_id: SegmentId) -> Result<(), ProcessingError> {
+            let segment = self.memory_segments.get_mut(&segment_id)
+                .ok_or_else(|| ProcessingError::SegmentNotFound(segment_id))?;
+
+            // Get primary copy
+            let primary_data = segment.data.read().await.clone();
+
+            // Sync all replicas
+            for (worker_id, replica) in &mut segment.replicas {
+                if replica.needs_sync() {
+                    self.sync_replica(worker_id, segment_id, &primary_data).await?;
+                }
+            }
+
+            Ok(())
+        }
+
+        async fn setup_training_shared_memory(
+            &self,
+            batch_id: BatchId,
+            samples: &[Sample],
+        ) -> Result<Arc<SharedMemoryAccess>, ProcessingError> {
+            // Calculate memory requirements
+            let memory_size = self.calculate_training_memory_size(samples)?;
+
+            // Allocate through DistributedMemoryManager
+            let segment_id = self.memory_manager.allocate_shared_segment(
+                memory_size,
+                AccessPattern::Training {
+                    gradient_sync: true,
+                    parameter_sharing: true,
+                },
+            ).await?;
+
+            // Create SharedMemoryAccess
+            Ok(Arc::new(SharedMemoryAccess::new(
+                segment_id,
+                self.memory_manager.clone(),
+                AccessType::ReadWrite,
+            )))
+        }
+
+        fn calculate_training_memory_size(&self, samples: &[Sample]) -> Result<usize, ProcessingError> {
+            let base_size = samples.len() * std::mem::size_of::<Sample>();
+            let gradient_size = base_size; // Space for gradients
+            let parameter_size = self.model_parameters_size()?;
+
+            Ok(base_size + gradient_size + parameter_size)
+        }
+
+        async fn setup_inference_shared_memory(
+            &self,
+            batch_id: BatchId,
+            samples: &[Sample],
+        ) -> Result<Arc<SharedMemoryAccess>, ProcessingError> {
+            // Calculate memory requirements including KV cache
+            let memory_size = self.calculate_inference_memory_size(samples)?;
+
+            // Allocate through DistributedMemoryManager
+            let segment_id = self.memory_manager.allocate_shared_segment(
+                memory_size,
+                AccessPattern::Inference {
+                    kv_cache: true,
+                    pipeline_stages: true,
+                },
+            ).await?;
+
+            // Create SharedMemoryAccess
+            Ok(Arc::new(SharedMemoryAccess::new(
+                segment_id,
+                self.memory_manager.clone(),
+                AccessType::ReadOnly,
+            )))
+        }
+
+        fn calculate_inference_memory_size(&self, samples: &[Sample]) -> Result<usize, ProcessingError> {
+            let base_size = samples.len() * std::mem::size_of::<Sample>();
+            let kv_cache_size = self.calculate_kv_cache_size(samples)?;
+            let pipeline_buffer = base_size / 4; // Buffer for pipeline stages
+
+            Ok(base_size + kv_cache_size + pipeline_buffer)
+        }
+
+    }
+}
+
+mod training {
+    pub struct TrainingPipeline {
+        model: ModelArchitecture,
+        optimizer: Box<dyn Optimizer>,
+        core_group: CoreGroup,
+        training_config: TrainingConfig,
+        metrics_tracker: Arc<MetricsTracker>,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct Tensor {
+        pub data: Vec<f32>,
+        pub shape: Vec<usize>,
+        pub requires_grad: bool,
+        pub grad: Option<Arc<RwLock<Vec<f32>>>>,
+        pub grad_fn: Option<Arc<dyn AutogradFunction>>,
+    }
+
+    #[derive(Debug, Clone)]
+    pub enum ActivationFunction {
+        ReLU,
+        Sigmoid,
+        Tanh,
+        LeakyReLU(f32),
+        Custom(Arc<dyn Fn(f32) -> f32 + Send + Sync>),
+    }
+
+    pub struct GradientSynchronizer {
+        shared_gradients: Arc<RwLock<GradientBuffer>>,
+        synchronization_strategy: SyncStrategy,
+        reduction_op: ReductionOp,
+    }
+
+    pub struct GradientBuffer {
+        gradients: HashMap<LayerId, Tensor>,
+        version: u64,
+        status: SyncStatus,
+    }
+
+    #[derive(Debug)]
+    pub struct SharedMLState {
+        pub model_parameters: Arc<RwLock<ModelParameters>>,
+        pub gradients: Arc<RwLock<GradientBuffer>>,
+        pub optimizer_state: Arc<RwLock<OptimizerState>>,
+        pub batch_statistics: Arc<RwLock<BatchStatistics>>,
+    }
+
+    #[derive(Debug)]
+    pub struct TrainingConfig {
+        pub batch_size: usize,
+        pub learning_rate: f32,
+        pub optimization_algorithm: OptimizationAlgorithm,
+        pub gradient_clip_norm: Option<f32>,
+        pub weight_decay: Option<f32>,
+        pub dropout_rate: Option<f32>,
+    }
+
+    #[derive(Debug)]
+    pub struct TensorMemory {
+        pub allocation_map: HashMap<TensorId, MemoryAllocation>,
+        pub shared_segments: Vec<SharedMemorySegment>,
+        pub cache_manager: TensorCache,
+    }
+
+    #[derive(Debug)]
+    pub struct SharedMemorySegment {
+        pub id: SegmentId,
+        pub data: Arc<RwLock<Vec<f32>>>,
+        pub access_pattern: AccessPattern,
+        pub current_users: HashSet<ProcessingUnitId>,
+    }
+
+    #[derive(Debug)]
+    pub struct ComputeContext {
+        pub current_stream: Option<ComputeStream>,
+        pub memory_manager: Arc<MemoryManager>,
+        pub kernel_cache: KernelCache,
+        pub execution_queue: VecDeque<ComputeTask>,
+    }
+
+    #[derive(Debug)]
+    pub struct BatchContext {
+        pub batch_id: BatchId,
+        pub inputs: Tensor,
+        pub targets: Option<Tensor>,
+        pub current_phase: BatchPhase,
+        pub shared_memory: SharedMemoryContext,
+    }
+
+    #[derive(Debug)]
+    pub enum BatchPhase {
+        Forward,
+        Backward,
+        GradientSync,
+        ParameterUpdate,
+    }
+
+    // Autograd System
+    pub trait AutogradFunction: Send + Sync {
+        fn forward(&self, inputs: &[&Tensor]) -> Result<Tensor, ProcessingError>;
+        fn backward(&self, grad_output: &Tensor) -> Result<Vec<Tensor>, ProcessingError>;
+    }
+
+    pub struct ComputeGraph {
+        nodes: HashMap<NodeId, ComputeNode>,
+        edges: Vec<(NodeId, NodeId)>,
+        gradients: HashMap<NodeId, Tensor>,
+    }
+
+    #[derive(Debug)]
+    pub enum ComputeNode {
+        Variable(Tensor),
+        Operation {
+            op: Box<dyn AutogradFunction>,
+            inputs: Vec<NodeId>,
+            output: Option<Tensor>,
+        },
+    }
+
+    #[derive(Debug)]
+    pub struct Layer {
+        pub parameters: HashMap<String, Tensor>,
+        pub gradients: HashMap<String, Tensor>,
+        pub activation: Option<ActivationFunction>,
+        pub forward_fn: Arc<dyn Fn(&Tensor) -> Result<Tensor, ProcessingError>>,
+        pub backward_fn: Arc<dyn Fn(&Tensor, &Tensor) -> Result<Tensor, ProcessingError>>,
+    }
+
+    #[derive(Debug)]
+    pub struct ModelArchitecture {
+        pub layers: Vec<Layer>,
+        pub loss_function: Arc<dyn LossFunction>,
+        pub initialization_scheme: InitializationScheme,
+    }
+
+    struct MatMulBackward {
+        left: Tensor,
+        right: Tensor,
+    }
+
+    impl TrainingPipeline {
+        pub fn new(
+            model: ModelArchitecture,
+            optimizer: Box<dyn Optimizer>,
+            core_group: CoreGroup,
+            config: TrainingConfig,
+        ) -> Self {
+            Self {
+                model,
+                optimizer,
+                core_group,
+                training_config: config,
+                metrics_tracker: Arc::new(MetricsTracker::new()),
+            }
+        }
+
+        pub async fn train(
+            &mut self,
+            dataset: Dataset,
+            num_epochs: usize,
+        ) -> Result<TrainingHistory, ProcessingError> {
+            let mut history = TrainingHistory::new();
+
+            for epoch in 0..num_epochs {
+                let epoch_metrics = self.train_epoch(&dataset).await?;
+                history.record_epoch(epoch, epoch_metrics);
+
+                // Validation if provided
+                if let Some(val_dataset) = &dataset.validation {
+                    let val_metrics = self.validate(val_dataset).await?;
+                    history.record_validation(epoch, val_metrics);
+                }
+
+                // Learning rate scheduling
+                self.optimizer.step_scheduler(epoch_metrics);
+            }
+
+            Ok(history)
+        }
+
+        async fn train_epoch(
+            &mut self,
+            dataset: &Dataset,
+        ) -> Result<EpochMetrics, ProcessingError> {
+            let mut epoch_metrics = EpochMetrics::new();
+
+            // Create data loader with shuffling
+            let data_loader = DataLoader::new(
+                dataset,
+                self.training_config.batch_size,
+                true,
+            );
+
+            for batch in data_loader {
+                // Process batch
+                let batch_metrics = self.train_batch(batch).await?;
+                epoch_metrics.update(batch_metrics);
+
+                // Early stopping check
+                if self.should_early_stop(&epoch_metrics) {
+                    break;
+                }
+            }
+
+            Ok(epoch_metrics)
+        }
+
+        async fn train_batch(
+            &mut self,
+            batch: DataBatch,
+        ) -> Result<BatchMetrics, ProcessingError> {
+            // Pre-process batch
+            let processed_batch = self.prepare_batch(batch)?;
+
+            // Train on core group
+            let result = self.core_group
+                .train_batch(processed_batch.inputs, processed_batch.targets)
+                .await?;
+
+            // Update metrics
+            self.metrics_tracker.record_batch_metrics(&result.metrics).await?;
+
+            Ok(result.metrics)
+        }
+    }
+
+    impl Tensor {
+        pub fn new(data: Vec<f32>, shape: Vec<usize>, requires_grad: bool) -> Self {
+            Self {
+                data,
+                shape,
+                requires_grad,
+                grad: if requires_grad {
+                    Some(Arc::new(RwLock::new(vec![0.0; data.len()])))
+                } else {
+                    None
+                },
+                grad_fn: None,
+            }
+        }
+
+        pub fn zeros(shape: &[usize], requires_grad: bool) -> Self {
+            let size = shape.iter().product();
+            Self::new(vec![0.0; size], shape.to_vec(), requires_grad)
+        }
+
+        pub fn randn(shape: &[usize], requires_grad: bool) -> Self {
+            use rand::distributions::{Distribution, Standard};
+            let mut rng = rand::thread_rng();
+            let size = shape.iter().product();
+            let data: Vec<f32> = Standard.sample_iter(&mut rng).take(size).collect();
+            Self::new(data, shape.to_vec(), requires_grad)
+        }
+
+        // Basic operations
+        pub fn matmul(&self, other: &Tensor) -> Result<Tensor, ProcessingError> {
+            let result = self.execute_operation(
+                Operation::MatMul,
+                &[other],
+                MatMulBackward::new(self.clone(), other.clone()),
+            )?;
+            Ok(result)
+        }
+
+        pub fn add(&self, other: &Tensor) -> Result<Tensor, ProcessingError> {
+            let result = self.execute_operation(
+                Operation::Add,
+                &[other],
+                AddBackward::new(self.clone(), other.clone()),
+            )?;
+            Ok(result)
+        }
+
+        // Autograd support
+        fn execute_operation(
+            &self,
+            op: Operation,
+            inputs: &[&Tensor],
+            backward_fn: Box<dyn AutogradFunction>,
+        ) -> Result<Tensor, ProcessingError> {
+            let requires_grad = self.requires_grad || inputs.iter().any(|t| t.requires_grad);
+            let mut result = op.forward(self, inputs)?;
+
+            if requires_grad {
+                result.grad_fn = Some(Arc::new(backward_fn));
+            }
+
+            Ok(result)
+        }
+
+        pub fn backward(&self) -> Result<(), ProcessingError> {
+            if !self.requires_grad {
+                return Err(ProcessingError::AutogradError(
+                    "Tensor doesn't require gradients".into()
+                ));
+            }
+
+            // Initialize gradient computation
+            let mut grad = self.grad.as_ref().unwrap().write().await;
+            grad.fill(1.0);
+
+            // Build computation graph
+            let mut graph = ComputeGraph::new();
+            self.build_graph(&mut graph)?;
+
+            // Execute backward pass
+            graph.backward()?;
+
+            Ok(())
+        }
+    }
+
+    impl AutogradFunction for MatMulBackward {
+        fn forward(&self, inputs: &[&Tensor]) -> Result<Tensor, ProcessingError> {
+            // Matrix multiplication implementation
+            let left = &inputs[0];
+            let right = &inputs[1];
+
+            if left.shape[1] != right.shape[0] {
+                return Err(ProcessingError::DimensionMismatch(
+                    format!("Shapes {:?} and {:?} incompatible for matmul",
+                    left.shape, right.shape)
+                ));
+            }
+
+            let mut result = Tensor::zeros(
+                &[left.shape[0], right.shape[1]],
+                left.requires_grad || right.requires_grad
+            );
+
+            // Actual computation
+            for i in 0..left.shape[0] {
+                for j in 0..right.shape[1] {
+                    let mut sum = 0.0;
+                    for k in 0..left.shape[1] {
+                        sum += left.data[i * left.shape[1] + k] *
+                               right.data[k * right.shape[1] + j];
+                    }
+                    result.data[i * right.shape[1] + j] = sum;
+                }
+            }
+
+            Ok(result)
+        }
+
+        fn backward(&self, grad_output: &Tensor) -> Result<Vec<Tensor>, ProcessingError> {
+            // Compute gradients for both inputs
+            let left_grad = grad_output.matmul(&self.right.transpose())?;
+            let right_grad = self.left.transpose().matmul(grad_output)?;
+
+            Ok(vec![left_grad, right_grad])
+        }
+    }
+
+    // Computation Graph Implementation
+    impl ComputeGraph {
+        pub fn new() -> Self {
+            Self {
+                nodes: HashMap::new(),
+                edges: Vec::new(),
+                gradients: HashMap::new(),
+            }
+        }
+
+        pub fn add_node(&mut self, node: ComputeNode) -> NodeId {
+            let id = NodeId(Uuid::new_v4());
+            self.nodes.insert(id, node);
+            id
+        }
+
+        pub fn backward(&mut self) -> Result<(), ProcessingError> {
+            // Topological sort
+            let ordered_nodes = self.topological_sort()?;
+
+            // Execute backward pass
+            for node_id in ordered_nodes.iter().rev() {
+                if let Some(node) = self.nodes.get(node_id) {
+                    match node {
+                        ComputeNode::Operation { op, inputs, output } => {
+                            let grad_output = self.gradients.get(node_id)
+                                .ok_or(ProcessingError::AutogradError(
+                                    "Missing gradient".into()
+                                ))?;
+
+                            let input_grads = op.backward(grad_output)?;
+
+                            // Propagate gradients to inputs
+                            for (input_id, grad) in inputs.iter().zip(input_grads) {
+                                self.accumulate_gradient(*input_id, grad)?;
+                            }
+                        },
+                        ComputeNode::Variable(_) => continue,
+                    }
+                }
+            }
+
+            Ok(())
+        }
+
+        fn accumulate_gradient(
+            &mut self,
+            node_id: NodeId,
+            grad: Tensor,
+        ) -> Result<(), ProcessingError> {
+            if let Some(existing_grad) = self.gradients.get_mut(&node_id) {
+                *existing_grad = existing_grad.add(&grad)?;
+            } else {
+                self.gradients.insert(node_id, grad);
+            }
+            Ok(())
+        }
+
+        fn topological_sort(&self) -> Result<Vec<NodeId>, ProcessingError> {
+            let mut visited = HashSet::new();
+            let mut order = Vec::new();
+
+            fn visit(
+                node_id: NodeId,
+                graph: &ComputeGraph,
+                visited: &mut HashSet<NodeId>,
+                order: &mut Vec<NodeId>,
+            ) -> Result<(), ProcessingError> {
+                if visited.contains(&node_id) {
+                    return Ok(());
+                }
+
+                visited.insert(node_id);
+
+                if let Some(ComputeNode::Operation { inputs, .. }) = graph.nodes.get(&node_id) {
+                    for input_id in inputs {
+                        visit(*input_id, graph, visited, order)?;
+                    }
+                }
+
+                order.push(node_id);
+                Ok(())
+            }
+
+            for node_id in self.nodes.keys() {
+                visit(*node_id, self, &mut visited, &mut order)?;
+            }
+
+            Ok(order)
+        }
+    }
+
+    // Neural Network Layer Operations
+    impl Layer {
+        pub fn linear(in_features: usize, out_features: usize) -> Self {
+            let mut parameters = HashMap::new();
+
+            // Initialize weights and biases
+            parameters.insert(
+                "weight".to_string(),
+                Tensor::randn(&[out_features, in_features], true)
+            );
+            parameters.insert(
+                "bias".to_string(),
+                Tensor::zeros(&[out_features], true)
+            );
+
+            let forward_fn = Arc::new(move |input: &Tensor| {
+                let weight = parameters.get("weight").unwrap();
+                let bias = parameters.get("bias").unwrap();
+
+                let output = input.matmul(weight)?;
+                output.add(bias)
+            });
+
+            Self {
+                parameters,
+                gradients: HashMap::new(),
+                activation: None,
+                forward_fn,
+                backward_fn: Arc::new(linear_backward),
+            }
+        }
+    }
+
+    impl GradientSynchronizer {
+        async fn synchronize_gradients(
+            &mut self,
+            batch_result: &BatchResult,
+        ) -> Result<(), ProcessingError> {
+            match &self.processing_pattern {
+                ProcessingPattern::WarpBased { .. } => {
+                    self.synchronize_warp_gradients(batch_result).await
+                },
+                ProcessingPattern::ThreadBased { .. } => {
+                    self.synchronize_thread_gradients(batch_result).await
+                },
+                ProcessingPattern::Hybrid { .. } => {
+                    self.synchronize_hybrid_gradients(batch_result).await
+                }
+            }
+        }
+
+        async fn synchronize_warp_gradients(
+            &mut self,
+            batch_result: &BatchResult,
+        ) -> Result<(), ProcessingError> {
+            // Phase 1: Local reduction within warps
+            for unit in &mut self.processing_units {
+                unit.reduce_local_gradients().await?;
+            }
+
+            // Phase 2: Warp sync barrier
+            self.batch_coordinator.wait_for_warp_sync().await?;
+
+            // Phase 3: Cross-warp reduction
+            let reduced_gradients = self.gradient_synchronizer.reduce_across_warps(
+                &self.processing_units,
+                &self.shared_memory_manager,
+            ).await?;
+
+            // Phase 4: Broadcast final gradients
+            for unit in &mut self.processing_units {
+                unit.update_gradients(&reduced_gradients).await?;
+            }
+
+            Ok(())
+        }
+
+        async fn synchronize_thread_gradients(
+            &mut self,
+            batch_result: &BatchResult,
+        ) -> Result<(), ProcessingError> {
+            // Phase 1: Thread local reduction
+            let mut local_gradients = Vec::new();
+            for unit in &mut self.processing_units {
+                let grad = unit.get_local_gradients().await?;
+                local_gradients.push(grad);
+            }
+
+            // Phase 2: NUMA-aware reduction
+            let numa_nodes = self.get_numa_mapping()?;
+            let mut reduced_gradients = GradientBuffer::new();
+
+            for node in numa_nodes {
+                let node_gradients = self.reduce_numa_node_gradients(
+                    node,
+                    &local_gradients
+                ).await?;
+                reduced_gradients.merge(node_gradients)?;
+            }
+
+            // Phase 3: Update all units with final gradients
+            let shared_gradients = Arc::new(RwLock::new(reduced_gradients));
+
+            let update_futures: Vec<_> = self.processing_units
+                .iter_mut()
+                .map(|unit| unit.update_gradients(&shared_gradients))
+                .collect();
+
+            futures::future::join_all(update_futures).await;
+
+            Ok(())
+        }
+
+        async fn synchronize_hybrid_gradients(
+            &mut self,
+            batch_result: &BatchResult,
+        ) -> Result<(), ProcessingError> {
+            // Phase 1: Separate GPU and CPU gradients
+            let (gpu_units, cpu_units): (Vec<_>, Vec<_>) = self.processing_units
+                .iter_mut()
+                .partition(|unit| matches!(unit.core_type, CoreType::CUDA { .. }));
+
+            // Phase 2: Parallel GPU and CPU reduction
+            let (gpu_grads, cpu_grads) = tokio::join!(
+                self.reduce_gpu_gradients(&gpu_units),
+                self.reduce_cpu_gradients(&cpu_units)
+            );
+
+            // Phase 3: Merge GPU and CPU gradients
+            let final_gradients = self.merge_hybrid_gradients(
+                gpu_grads?,
+                cpu_grads?,
+                &self.cost_profile
+            )?;
+
+            // Phase 4: Update all units
+            for unit in &mut self.processing_units {
+                unit.update_gradients(&final_gradients).await?;
+            }
+
+            Ok(())
+        }
+    }
+
+    impl BatchCoordinator {
+        async fn start_batch_processing(
+            &mut self,
+            mode: ProcessingMode,
+        ) -> Result<(), ProcessingError> {
+            for (batch_id, batch_state) in &mut self.batch_coordinator.current_batches {
+                // Get samples for this batch
+                let batch_samples = match mode {
+                    ProcessingMode::Training { batch_size, .. } => {
+                        self.work_queue.get_training_batch(batch_size)?
+                    },
+                    ProcessingMode::Inference { sequence_length, .. } => {
+                        self.work_queue.get_inference_batch(sequence_length)?
+                    }
+                };
+
+                // Setup shared memory based on mode
+                let shared_memory = match mode {
+                    ProcessingMode::Training { .. } => {
+                        self.setup_training_shared_memory(batch_id, &batch_samples).await?
+                    },
+                    ProcessingMode::Inference { .. } => {
+                        self.setup_inference_shared_memory(batch_id, &batch_samples).await?
+                    }
+                };
+
+                // Distribute work to processing units
+                self.distribute_batch_to_units(
+                    batch_id,
+                    batch_samples,
+                    shared_memory,
+                    mode,
+                ).await?;
+            }
+
+            Ok(())
+        }
+
+        async fn distribute_batch_to_units(
+            &mut self,
+            batch_id: BatchId,
+            samples: Vec<Sample>,
+            shared_memory: Arc<SharedMemoryAccess>,
+            mode: ProcessingMode,
+        ) -> Result<(), ProcessingError> {
+            // Create chunks based on processing pattern
+            let chunks = match &self.processing_pattern {
+                ProcessingPattern::WarpBased { warp_size, .. } => {
+                    self.create_warp_chunks(&samples, *warp_size)?
+                },
+                ProcessingPattern::ThreadBased { thread_count, .. } => {
+                    self.create_thread_chunks(&samples, *thread_count)?
+                },
+                ProcessingPattern::Hybrid { gpu_cores, cpu_cores, .. } => {
+                    self.create_hybrid_chunks(
+                        &samples,
+                        gpu_cores.len(),
+                        cpu_cores.len()
+                    )?
+                }
+            };
+
+            // Assign work to processing units
+            for (unit_id, chunk) in self.processing_units
+                .iter()
+                .map(|u| u.id)
+                .zip(chunks)
+            {
+                if let Some(unit) = self.get_processing_unit(unit_id) {
+                    let context = match mode {
+                        ProcessingMode::Training { .. } => {
+                            BatchContext::new_training(
+                                batch_id,
+                                shared_memory.clone(),
+                                chunk,
+                            )
+                        },
+                        ProcessingMode::Inference { .. } => {
+                            BatchContext::new_inference(
+                                batch_id,
+                                shared_memory.clone(),
+                                chunk,
+                            )
+                        }
+                    };
+                    unit.process_work(context).await?;
+                }
+            }
+
+            Ok(())
+        }
+
+        async fn create_warp_chunks(
+            &self,
+            samples: &[Sample],
+            warp_size: usize,
+        ) -> Result<Vec<WorkChunk>, ProcessingError> {
+            let mut chunks = Vec::new();
+
+            // Calculate chunk size based on warp size and memory constraints
+            let chunk_size = self.calculate_warp_chunk_size(warp_size)?;
+
+            // Create memory segments through DistributedMemoryManager
+            for chunk in samples.chunks(chunk_size) {
+                let segment_id = self.memory_manager.allocate_shared_segment(
+                    chunk.len() * std::mem::size_of::<Sample>(),
+                    AccessPattern::WarpBased {
+                        warp_size,
+                        coalesced: true,
+                    },
+                ).await?;
+
+                chunks.push(WorkChunk {
+                    samples: chunk.to_vec(),
+                    memory_segment: segment_id,
+                    execution_pattern: ChunkPattern::Warp {
+                        size: warp_size,
+                    },
+                });
+            }
+
+            Ok(chunks)
+        }
+
+        fn calculate_warp_chunk_size(&self, warp_size: usize) -> Result<usize, ProcessingError> {
+            // Base size based on warp
+            let base_size = warp_size * self.get_warp_multiplier();
+
+            // Adjust for GPU memory constraints
+            let gpu_memory = self.get_available_gpu_memory()?;
+            let sample_size = std::mem::size_of::<Sample>();
+            let max_size = gpu_memory / sample_size / 2; // Leave half memory free
+
+            Ok(base_size.min(max_size))
+        }
+
+        async fn create_thread_chunks(
+            &self,
+            samples: &[Sample],
+            thread_count: usize,
+        ) -> Result<Vec<WorkChunk>, ProcessingError> {
+            let mut chunks = Vec::new();
+
+            // Calculate NUMA-aware chunk size
+            let chunk_size = self.calculate_thread_chunk_size(thread_count)?;
+
+            for chunk in samples.chunks(chunk_size) {
+                let segment_id = self.memory_manager.allocate_shared_segment(
+                    chunk.len() * std::mem::size_of::<Sample>(),
+                    AccessPattern::ThreadBased {
+                        thread_count,
+                        numa_node: self.get_numa_node()?,
+                    },
+                ).await?;
+
+                chunks.push(WorkChunk {
+                    samples: chunk.to_vec(),
+                    memory_segment: segment_id,
+                    execution_pattern: ChunkPattern::Thread {
+                        count: thread_count,
+                    },
+                });
+            }
+
+            Ok(chunks)
+        }
+
+        fn calculate_thread_chunk_size(&self, thread_count: usize) -> Result<usize, ProcessingError> {
+            // Get NUMA node cache sizes
+            let numa_node = self.get_numa_node()?;
+            let l3_cache_size = numa_node.get_l3_cache_size()?;
+
+            // Calculate size based on cache and thread count
+            let sample_size = std::mem::size_of::<Sample>();
+            let cache_based_size = l3_cache_size / sample_size / thread_count;
+
+            Ok(cache_based_size)
+        }
+
+        fn get_numa_node(&self) -> Result<NumaNode, ProcessingError> {
+            let numa_topology = self.system_info.get_numa_topology()?;
+
+            // Get current thread's NUMA node
+            let current_node = numa_topology.get_current_node()?;
+
+            // Check if node is available
+            if !current_node.is_available() {
+                return Err(ProcessingError::ResourceUnavailable(
+                    "NUMA node not available".into()
+                ));
+            }
+
+            Ok(current_node)
+        }
+
+        async fn create_hybrid_chunks(
+            &self,
+            samples: &[Sample],
+            gpu_count: usize,
+            cpu_count: usize,
+        ) -> Result<Vec<WorkChunk>, ProcessingError> {
+            let mut chunks = Vec::new();
+
+            // Split based on device capabilities
+            let (gpu_samples, cpu_samples) = self.split_hybrid_samples(
+                samples,
+                gpu_count,
+                cpu_count,
+            )?;
+
+            // Create GPU chunks
+            for gpu_chunk in gpu_samples.chunks(self.calculate_gpu_chunk_size()?) {
+                let segment_id = self.memory_manager.allocate_shared_segment(
+                    gpu_chunk.len() * std::mem::size_of::<Sample>(),
+                    AccessPattern::GPU {
+                        pinned: true,
+                        streaming: true,
+                    },
+                ).await?;
+
+                chunks.push(WorkChunk {
+                    samples: gpu_chunk.to_vec(),
+                    memory_segment: segment_id,
+                    execution_pattern: ChunkPattern::GPU,
+                });
+            }
+
+            // Create CPU chunks
+            for cpu_chunk in cpu_samples.chunks(self.calculate_cpu_chunk_size()?) {
+                let segment_id = self.memory_manager.allocate_shared_segment(
+                    cpu_chunk.len() * std::mem::size_of::<Sample>(),
+                    AccessPattern::CPU {
+                        cache_aligned: true,
+                    },
+                ).await?;
+
+                chunks.push(WorkChunk {
+                    samples: cpu_chunk.to_vec(),
+                    memory_segment: segment_id,
+                    execution_pattern: ChunkPattern::CPU,
+                });
+            }
+
+            Ok(chunks)
+        }
+
+        fn calculate_gpu_chunk_size(&self) -> Result<usize, ProcessingError> {
+            let gpu_specs = self.get_gpu_specifications()?;
+
+            // Base on GPU memory and compute capability
+            let memory_limit = gpu_specs.available_memory as usize;
+            let compute_units = gpu_specs.compute_capability as usize;
+
+            Ok((memory_limit / std::mem::size_of::<Sample>())
+                .min(compute_units * self.get_gpu_batch_multiplier()))
+        }
+
+        fn calculate_cpu_chunk_size(&self) -> Result<usize, ProcessingError> {
+            let cpu_specs = self.get_cpu_specifications()?;
+
+            // Base on CPU cache and SIMD width
+            let cache_size = cpu_specs.l3_cache_size;
+            let simd_width = cpu_specs.simd_width.unwrap_or(1);
+
+            Ok((cache_size / std::mem::size_of::<Sample>())
+                .min(simd_width * self.get_cpu_batch_multiplier()))
+        }
+
+        async fn monitor_batch_progress(
+            &mut self,
+            batch_id: BatchId,
+        ) -> Result<(), ProcessingError> {
+            let mut stragglers = Vec::new();
+
+            if let Some(batch_state) = self.batch_coordinator.current_batches.get(batch_id) {
+                for (unit_id, unit_state) in &batch_state.assigned_units {
+                    if unit_state.is_straggler(self.batch_coordinator.straggler_threshold) {
+                        stragglers.push(*unit_id);
+                    }
+                }
+            }
+
+            if !stragglers.is_empty() {
+                self.handle_stragglers(batch_id, stragglers).await?;
+            }
+
+            Ok(())
+        }
+    }
+}
+
+mod optimizers {
+    pub trait Optimizer: Send + Sync {
+        fn step(
+            &mut self,
+            parameters: &mut ModelParameters,
+            gradients: &GradientBuffer,
+        ) -> Result<(), ProcessingError>;
+
+        fn step_scheduler(&mut self, metrics: EpochMetrics);
+        fn get_current_lr(&self) -> f32;
+    }
+
+    pub struct Adam {
+        lr: f32,
+        betas: (f32, f32),
+        eps: f32,
+        step_count: usize,
+        moment1: HashMap<String, Tensor>,
+        moment2: HashMap<String, Tensor>,
+    }
+
+    pub struct SGD {
+        learning_rate: f32,
+        momentum: Option<f32>,
+        step_count: usize,
+        moment: HashMap<String, Tensor>,
+    }
+
+    pub struct RMSProp {
+        learning_rate: f32,
+        decay: f32,
+        eps: f32,
+        momentum: Option<f32>,
+        step_count: usize,
+        moment: HashMap<String, Tensor>,
+    }
+
+    impl Optimizer for Adam {
+        fn step(
+            &mut self,
+            parameters: &mut ModelParameters,
+            gradients: &GradientBuffer,
+        ) -> Result<(), ProcessingError> {
+            self.step_count += 1;
+            let bias_correction1 = 1.0 - self.betas.0.powi(self.step_count as i32);
+            let bias_correction2 = 1.0 - self.betas.1.powi(self.step_count as i32);
+
+            for (name, param) in parameters.iter_mut() {
+                let grad = gradients.get(name)
+                    .ok_or_else(|| ProcessingError::OptimizationError(
+                        format!("Missing gradient for parameter {}", name)
+                    ))?;
+
+                // Get or initialize moments
+                let m = self.moment1.entry(name.clone())
+                    .or_insert_with(|| Tensor::zeros(&param.shape, false));
+                let v = self.moment2.entry(name.clone())
+                    .or_insert_with(|| Tensor::zeros(&param.shape, false));
+
+                // Update moments
+                m.mul_scalar(self.betas.0).add(&grad.mul_scalar(1.0 - self.betas.0))?;
+                v.mul_scalar(self.betas.1)
+                    .add(&grad.mul_scalar(grad).mul_scalar(1.0 - self.betas.1))?;
+
+                // Compute bias corrected moments
+                let m_hat = m.mul_scalar(1.0 / bias_correction1);
+                let v_hat = v.mul_scalar(1.0 / bias_correction2);
+
+                // Update parameters
+                let update = m_hat.div(&v_hat.sqrt().add_scalar(self.eps))?
+                    .mul_scalar(self.lr);
+                param.sub_(&update)?;
+            }
+
+            Ok(())
+        }
+
+        fn step_scheduler(&mut self, metrics: EpochMetrics) {
+            // Implement learning rate scheduling if needed
+        }
+
+        fn get_current_lr(&self) -> f32 {
+            self.lr
+        }
+}
+
+mod inference {
+    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, RwLock};
+    use uuid::Uuid;
+    use chrono::{DateTime, Utc, Duration};
+    use crate::core::{CoreGroup, ProcessingUnit, CoreId};
+    use crate::metrics::MetricsTracker;
+    use crate::memory::{MemoryManager, SharedMemoryAccess};
+    use crate::errors::ProcessingError;
+
+    pub struct InferencePipeline {
+        model: ModelArchitecture,
+        core_group: CoreGroup,
+        inference_config: InferenceConfig,
+        metrics_tracker: Arc<MetricsTracker>,
+        memory_manager: Arc<MemoryManager>,
+        pipeline_coordinator: PipelineCoordinator,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct InferenceConfig {
+        pub max_sequence_length: usize,
+        pub max_batch_size: usize,
+        pub pipeline_parallel_degree: usize,
+        pub tensor_parallel_degree: usize,
+        pub attention_slice_size: usize,
+        pub cache_config: KVCacheConfig,
+        pub runtime_config: RuntimeConfig,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct KVCacheConfig {
+        pub max_cache_size: usize,
+        pub num_layers: usize,
+        pub head_dim: usize,
+        pub pruning_mode: CachePruningMode,
+    }
+
+    #[derive(Debug, Clone)]
+    pub enum CachePruningMode {
+        None,
+        LRU { max_tokens: usize },
+        Adaptive { memory_threshold: f32 },
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct RuntimeConfig {
+        pub dtype: DataType,
+        pub quantization: Option<QuantizationConfig>,
+        pub memory_efficient_attention: bool,
+        pub use_flash_attention: bool,
+        pub max_concurrent_requests: usize,
+    }
+
+    #[derive(Debug)]
+    pub struct PipelineCoordinator {
+        stages: Vec<PipelineStage>,
+        stage_queues: HashMap<StageId, VecDeque<MicroBatch>>,
+        active_sequences: HashMap<SequenceId, SequenceState>,
+        memory_manager: Arc<MemoryManager>,
+        metrics: PipelineMetrics,
+    }
+
+    #[derive(Debug)]
+    pub struct PipelineStage {
+        id: StageId,
+        stage_type: StageType,
+        processing_units: Vec<ProcessingUnit>,
+        memory_allocation: SharedMemoryAccess,
+        current_state: StageState,
+    }
+
+    #[derive(Debug)]
+    pub enum StageType {
+        Embedding,
+        Attention {
+            num_heads: usize,
+            head_dim: usize,
+            use_flash_attention: bool,
+        },
+        FeedForward {
+            hidden_dim: usize,
+            activation: ActivationType,
+        },
+        LayerNorm {
+            normalized_shape: Vec<usize>,
+        },
+    }
+
+    #[derive(Debug)]
+    pub struct SequenceState {
+        pub sequence_id: SequenceId,
+        pub current_length: usize,
+        pub kv_cache: Option<KVCache>,
+        pub attention_mask: Option<AttentionMask>,
+        pub pipeline_location: PipelineLocation,
+    }
+
+    #[derive(Debug)]
+    pub struct KVCache {
+        pub keys: HashMap<LayerId, Tensor>,
+        pub values: HashMap<LayerId, Tensor>,
+        pub capacity: usize,
+        pub current_size: usize,
+    }
+
+    #[derive(Debug)]
+    pub struct MicroBatch {
+        pub id: BatchId,
+        pub tokens: Tensor,
+        pub position_ids: Tensor,
+        pub attention_mask: Option<AttentionMask>,
+        pub cache_indices: Option<Vec<usize>>,
+    }
+
+    #[derive(Debug)]
+    pub struct GenerationConfig {
+        pub max_length: usize,
+        pub temperature: f32,
+        pub top_p: f32,
+        pub top_k: Option<usize>,
+        pub repetition_penalty: f32,
+        pub stop_sequences: Vec<String>,
+    }
+
+    #[derive(Debug)]
+    pub struct GenerationResult {
+        pub text: String,
+        pub tokens: Vec<usize>,
+        pub metrics: GenerationMetrics,
+    }
+
+    #[derive(Debug)]
+    pub struct GenerationMetrics {
+        pub total_time: Duration,
+        pub tokens_per_second: f32,
+        pub pipeline_efficiency: f32,
+        pub memory_usage: MemoryMetrics,
+        pub cache_stats: KVCacheStats,
+    }
+
+    #[derive(Debug)]
+    pub struct KVCacheStats {
+        pub total_size: usize,
+        pub num_entries: usize,
+        pub hit_rate: f32,
+        pub eviction_count: usize,
+    }
+
+    impl InferencePipeline {
+        pub fn new(
+            model: ModelArchitecture,
+            core_group: CoreGroup,
+            config: InferenceConfig,
+        ) -> Self {
+            let pipeline_coordinator = PipelineCoordinator::new(
+                &model,
+                &core_group,
+                &config,
+            );
+
+            Self {
+                model,
+                core_group,
+                inference_config: config,
+                metrics_tracker: Arc::new(MetricsTracker::new()),
+                memory_manager: Arc::new(MemoryManager::new()),
+                pipeline_coordinator,
+            }
+        }
+
+        pub async fn generate(
+            &mut self,
+            prompt: &str,
+            generation_config: GenerationConfig,
+        ) -> Result<GenerationResult, ProcessingError> {
+            // Initialize sequence state
+            let sequence_id = SequenceId::new();
+            let sequence_state = self.initialize_sequence(prompt, &generation_config)?;
+
+            self.pipeline_coordinator.register_sequence(sequence_id, sequence_state);
+
+            // Generate tokens
+            let mut output_tokens = Vec::new();
+            let mut current_tokens = self.tokenize_prompt(prompt)?;
+
+            while !self.should_stop_generating(&output_tokens, &generation_config) {
+                // Prepare micro-batch
+                let micro_batch = self.prepare_micro_batch(
+                    &current_tokens,
+                    sequence_id,
+                )?;
+
+                // Process through pipeline
+                let output = self.pipeline_coordinator
+                    .process_micro_batch(micro_batch)
+                    .await?;
+
+                // Sample next token
+                let next_token = self.sample_next_token(output, &generation_config)?;
+                output_tokens.push(next_token);
+                current_tokens = self.update_current_tokens(current_tokens, next_token);
+            }
+
+            Ok(GenerationResult {
+                text: self.detokenize(&output_tokens)?,
+                tokens: output_tokens,
+                metrics: self.collect_generation_metrics(),
+            })
+        }
+
+        pub async fn batch_inference(
+            &mut self,
+            inputs: Vec<Tensor>,
+        ) -> Result<Vec<Tensor>, ProcessingError> {
+            // Organize inputs into micro-batches
+            let micro_batches = self.create_micro_batches(inputs)?;
+            let mut results = Vec::new();
+
+            // Process micro-batches through pipeline
+            for batch in micro_batches {
+                let output = self.pipeline_coordinator
+                    .process_micro_batch(batch)
+                    .await?;
+                results.push(output);
+            }
+
+            Ok(self.combine_results(results)?)
+        }
+    }
+
+    impl PipelineCoordinator {
+        pub async fn process_micro_batch(
+            &mut self,
+            batch: MicroBatch,
+        ) -> Result<Tensor, ProcessingError> {
+            let mut current_output = batch.tokens;
+
+            // Process through pipeline stages
+            for stage in &mut self.stages {
+                // Queue management
+                self.stage_queues
+                    .get_mut(&stage.id)
+                    .unwrap()
+                    .push_back(MicroBatch {
+                        tokens: current_output,
+                        ..batch.clone()
+                    });
+
+                // Process stage
+                current_output = stage.process_tokens(
+                    current_output,
+                    &batch.attention_mask,
+                    batch.cache_indices.as_ref(),
+                ).await?;
+
+                // Update metrics
+                self.metrics.record_stage_processing(&stage.id, &current_output);
+            }
+
+            Ok(current_output)
+        }
+
+        async fn schedule_stages(&mut self) -> Result<(), ProcessingError> {
+            for stage in &mut self.stages {
+                if let Some(batch) = self.stage_queues[&stage.id].pop_front() {
+                    stage.process_async(batch).await?;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl PipelineStage {
+        pub async fn process_tokens(
+            &mut self,
+            tokens: Tensor,
+            attention_mask: &Option<AttentionMask>,
+            cache_indices: Option<&Vec<usize>>,
+        ) -> Result<Tensor, ProcessingError> {
+            match &self.stage_type {
+                StageType::Attention { num_heads, head_dim, use_flash_attention } => {
+                    self.process_attention(
+                        tokens,
+                        attention_mask,
+                        cache_indices,
+                        *num_heads,
+                        *head_dim,
+                        *use_flash_attention,
+                    ).await
+                },
+                StageType::FeedForward { hidden_dim, activation } => {
+                    self.process_ffn(tokens, *hidden_dim, activation).await
+                },
+                StageType::LayerNorm { normalized_shape } => {
+                    self.process_layer_norm(tokens, normalized_shape).await
+                },
+                StageType::Embedding => {
+                    self.process_embedding(tokens).await
+                },
+            }
+        }
+
+        async fn process_attention(
+            &mut self,
+            tokens: Tensor,
+            attention_mask: &Option<AttentionMask>,
+            cache_indices: Option<&Vec<usize>>,
+            num_heads: usize,
+            head_dim: usize,
+            use_flash_attention: bool,
+        ) -> Result<Tensor, ProcessingError> {
+            if use_flash_attention {
+                self.flash_attention(
+                    tokens,
+                    attention_mask,
+                    cache_indices,
+                    num_heads,
+                    head_dim,
+                ).await
+            } else {
+                self.standard_attention(
+                    tokens,
+                    attention_mask,
+                    cache_indices,
+                    num_heads,
+                    head_dim,
+                ).await
+            }
+        }
+    }
+}
+
 mod job {
     use serde::{Deserialize, Serialize};
     use uuid::Uuid;
@@ -1547,6 +3787,7 @@ mod job {
         location_requirements: Option<LocationRequirements>,
     }
 
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct WorkAssignment {
         pub id: Uuid,
         pub job_id: Uuid,
@@ -1554,14 +3795,7 @@ mod job {
         pub optimization_hints: OptimizationHints,
         pub locality_requirements: LocalityRequirements,
         pub status: WorkAssignmentStatus,
-    }
-
-    pub enum WorkAssignmentStatus {
-        Pending,
-        Assigned { core_id: CoreId },
-        Processing,
-        Completed,
-        Failed(String),
+        pub metrics: Option<AssignmentMetrics>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1573,34 +3807,47 @@ mod job {
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub enum JobStatus {
-        Validating,
         Pending {
-            in_queue_since: DateTime<Utc>,
+            submission_time: DateTime<Utc>,
         },
+        Analyzing,
         Scheduled {
             start_time: DateTime<Utc>,
+            assigned_resources: Vec<GroupId>,
         },
         Processing {
             started_at: DateTime<Utc>,
-            progress: f32,
-            stage: ProcessingStage,
+            progress: JobProgress,
+            active_groups: Vec<GroupId>,
         },
         Completed {
             finished_at: DateTime<Utc>,
-            results_available: bool,
+            results: JobResults,
         },
         Failed {
             error: String,
+            timestamp: DateTime<Utc>,
             recoverable: bool,
-            retry_count: u32,
+            failed_groups: Vec<GroupId>,
         },
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct JobResult {
-        pub job_id: Uuid,
-        pub result: Vec<u8>,
-        pub metrics: JobMetrics,
+    pub struct JobProgress {
+        pub total_samples: usize,
+        pub processed_samples: usize,
+        pub failed_samples: usize,
+        pub current_stage: ProcessingStage,
+        pub stage_progress: f32,
+        pub estimated_completion: DateTime<Utc>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct JobResults {
+        pub successful_samples: usize,
+        pub failed_samples: usize,
+        pub execution_metrics: JobMetrics,
+        pub cost_summary: CostSummary,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1642,6 +3889,76 @@ mod job {
             balancing_strategy: BalancingStrategy,
         },
     }
+
+    impl JobManager {
+        pub fn new(
+            core_group_manager: Arc<CoreGroupManager>,
+            metrics_tracker: Arc<MetricsTracker>,
+        ) -> Self {
+            Self {
+                active_jobs: HashMap::new(),
+                pending_assignments: Vec::new(),
+                core_group_manager,
+                metrics_tracker,
+                job_scheduler: JobScheduler::new(),
+            }
+        }
+
+        pub async fn submit_job(&mut self, job: ComputeJob) -> Result<Uuid, ProcessingError> {
+            // Validate job requirements
+            self.validate_job_requirements(&job.requirements)?;
+
+            // Analyze job for optimization hints
+            let analysis = self.analyze_job(&job).await?;
+
+            // Request core group from CoreGroupManager
+            let group_id = self.core_group_manager
+                .create_group_for_job(&job.requirements, &analysis.optimization_hints)
+                .await?;
+
+            // Create work assignments
+            let assignments = self.create_work_assignments(&job, &distribution)?;
+
+            // Store job
+            let job_id = job.id;
+            self.active_jobs.insert(job_id, job);
+            Ok(job_id)
+        }
+
+        async fn analyze_job(&self, job: &ComputeJob) -> Result<JobAnalysis, ProcessingError> {
+            // Set job status to analyzing
+            self.update_job_status(job.id, JobStatus::Analyzing).await?;
+
+            // Analyze compute requirements
+            let compute_profile = self.analyze_compute_requirements(
+                &job.requirements.compute_needs
+            )?;
+
+            // Analyze memory patterns
+            let memory_profile = self.analyze_memory_requirements(
+                &job.requirements.memory_needs
+            )?;
+
+            // Analyze network needs
+            let network_profile = self.analyze_network_requirements(
+                &job.requirements.network_needs
+            )?;
+
+            // Analyze samples
+            let sample_analysis = self.analyze_samples(&job.sample_distribution)?;
+
+            Ok(JobAnalysis {
+                compute_profile,
+                memory_profile,
+                network_profile,
+                sample_analysis,
+                estimated_duration: self.estimate_job_duration(&compute_profile, &sample_analysis)?,
+                optimization_hints: self.generate_optimization_hints(&compute_profile, &sample_analysis)?,
+                resource_requirements: self.determine_resource_requirements(job)?,
+            })
+        }
+
+
 }
 
 mod sample {
