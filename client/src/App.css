@@ -1,4 +1,8 @@
-.logo.vite:hover {
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+logo.vite:hover {
   filter: drop-shadow(0 0 2em #747bff);
 }
 

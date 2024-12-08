@@ -3411,6 +3411,7 @@ mod optimizers {
         fn get_current_lr(&self) -> f32 {
             self.lr
         }
+    }
 }
 
 mod inference {
@@ -3957,8 +3958,7 @@ mod job {
                 resource_requirements: self.determine_resource_requirements(job)?,
             })
         }
-
-
+    }
 }
 
 mod sample {
